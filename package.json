@@ -1,0 +1,75 @@
+{
+  "name": "quota-board",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A local multi-account subscription quota dashboard.",
+  "type": "module",
+  "main": "src/main.js",
+  "license": "MIT",
+  "author": "Quota Board contributors",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test",
+    "check": "node scripts/check.mjs",
+    "test:ui": "node scripts/smoke.mjs",
+    "test:floating": "node scripts/floating-smoke.mjs",
+    "start:floating": "electron . --floating",
+    "demo:floating": "electron . --floating --demo",
+    "pack": "electron-builder --dir",
+    "dist": "electron-builder",
+    "dmg": "node scripts/dmg.mjs",
+    "demo:screenshot": "electron . --demo --screenshot"
+  },
+  "dependencies": {
+    "@github/copilot-sdk": "1.0.30",
+    "cross-spawn": "7.0.6",
+    "which": "2.0.2"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.65.0",
+    "electron": "45.2.3",
+    "electron-builder": "26.18.0"
+  },
+  "overrides": {
+    "@electron/universal": {
+      "minimatch": "^11.0.1"
+    },
+    "app-builder-lib": {
+      "minimatch": "^11.0.1"
+    }
+  },
+  "build": {
+    "appId": "org.quotaboard.desktop",
+    "productName": "Quota Board",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "src/**",
+      "core/**",
+      "scripts/claude-statusline.mjs",
+      "package.json"
+    ],
+    "asarUnpack": [
+      "node_modules/@github/**"
+    ],
+    "mac": {
+      "target": [
+        "zip"
+      ],
+      "category": "public.app-category.developer-tools"
+    },
+    "win": {
+      "target": [
+        "nsis"
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    }
+  }
+}

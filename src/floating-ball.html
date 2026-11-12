@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'none'"
+    />
+    <title>Quota Board 悬浮球</title>
+    <link rel="stylesheet" href="floating.css" />
+  </head>
+  <body class="ball-page">
+    <button id="orb" aria-label="打开额度面板">
+      <svg class="orb-ring" viewBox="0 0 104 104" aria-hidden="true">
+        <defs>
+          <linearGradient id="orb-gradient" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0" stop-color="#4cb0ee"></stop>
+            <stop offset="1" stop-color="#5a5ee0"></stop>
+          </linearGradient>
+        </defs>
+        <circle
+          class="orb-track"
+          cx="52"
+          cy="52"
+          r="43"
+          pathLength="100"
+        ></circle>
+        <circle
+          id="orb-progress"
+          cx="52"
+          cy="52"
+          r="43"
+          pathLength="100"
+        ></circle>
+      </svg>
+      <span class="orb-core">
+        <span id="orb-brand" aria-hidden="true">◔</span>
+        <span id="orb-value">—</span>
+        <span id="orb-caption">未连接</span>
+      </span>
+    </button>
+    <script type="module" src="floating.js"></script>
+  </body>
+</html>

@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'none'"
+    />
+    <title>Quota Board 悬浮额度</title>
+    <link rel="stylesheet" href="floating.css" />
+  </head>
+  <body class="panel-page">
+    <svg class="defs" aria-hidden="true">
+      <defs>
+        <linearGradient id="ring-gradient" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0" stop-color="#4cb0ee" />
+          <stop offset="1" stop-color="#5a5ee0" />
+        </linearGradient>
+      </defs>
+    </svg>
+    <main class="float-panel">
+      <header class="panel-top">
+        <button id="back" class="icon-button" aria-label="返回服务列表" title="返回" hidden>‹</button>
+        <div class="top-title">
+          <h1 id="title">额度看板</h1>
+          <p id="subtitle"></p>
+        </div>
+      </header>
+      <section id="view" class="panel-body"></section>
+      <footer class="panel-bottom">
+        <span id="status" role="status"></span>
+        <button id="manage" class="icon-button" aria-label="管理账号" title="管理账号">⚙</button>
+        <button id="float-refresh" class="icon-button" aria-label="刷新全部账号" title="刷新全部账号">↻</button>
+      </footer>
+      <p id="float-error" role="alert" hidden></p>
+    </main>
+    <script type="module" src="floating.js"></script>
+  </body>
+</html>
