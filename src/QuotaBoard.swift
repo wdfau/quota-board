@@ -106,6 +106,11 @@ final class BoardStore: ObservableObject {
             }
             if cards.contains(where: { $0.geminiRoute != nil }) { cards.removeAll { $0.id == "gemini" } }
         }
+    }
+
+    func startRefreshing() {
+        guard timer == nil else { return }
+        refresh()
         timer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in
             self?.refresh()
         }
@@ -611,10 +616,145 @@ private struct RenameAccountView: View {
     }
 }
 
+private struct GettingStartedView: View {
+    private enum Step: Int, CaseIterable {
+        case menuBar, overview, accounts
+
+        var title: String {
+            switch self {
+            case .menuBar: return "从菜单栏打开"
+            case .overview: return "查看剩余额度"
+            case .accounts: return "连接你的账号"
+            }
+        }
+
+        var instruction: String {
+            switch self {
+            case .menuBar: return "点屏幕右上角的柱状图图标，打开或收起额度看板。"
+            case .overview: return "圆环显示当前账号的剩余额度。点服务图标进入详情，查看其他账号、额度周期和重置时间。"
+            case .accounts: return "先在你使用的服务中登录，再回到看板刷新。可以从一个服务开始。"
+            }
+        }
+    }
+
+    let skip: () -> Void
+    let finish: () -> Void
+    @State private var step = Step.menuBar
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text("第 \(step.rawValue + 1) 步，共 \(Step.allCases.count) 步")
+                .font(.subheadline).foregroundStyle(.secondary)
+            Text(step.title).font(.title2.weight(.semibold)).padding(.top, 6)
+                .accessibilityAddTraits(.isHeader)
+            Text(step.instruction).font(.body).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true).padding(.top, 6)
+
+            Group {
+                switch step {
+                case .menuBar: menuBarExample
+                case .overview: quotaExample
+                case .accounts: accounts
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .padding(.vertical, 18)
+
+            Divider()
+            HStack(spacing: 10) {
+                Button("跳过", action: skip)
+                Spacer()
+                if step != .menuBar {
+                    Button("上一步") {
+                        if let previous = Step(rawValue: step.rawValue - 1) { step = previous }
+                    }
+                }
+                Button(step == .accounts ? "开始使用" : "下一步") {
+                    if let next = Step(rawValue: step.rawValue + 1) {
+                        step = next
+                    } else {
+                        finish()
+                    }
+                }
+                .keyboardShortcut(.defaultAction)
+            }.padding(.top, 14)
+        }
+        .padding(24)
+        .frame(width: 500, height: 430)
+    }
+
+    private var menuBarExample: some View {
+        VStack(spacing: 12) {
+            HStack(spacing: 14) {
+                Spacer(minLength: 24)
+                Image(systemName: "chart.bar.fill")
+                    .frame(width: 31, height: 26)
+                    .background(Color.accentColor.opacity(0.16), in: RoundedRectangle(cornerRadius: 6))
+                Image(systemName: "wifi").foregroundStyle(.secondary)
+                Image(systemName: "controlcenter").foregroundStyle(.secondary)
+                Text("9:41").monospacedDigit().foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 16).padding(.vertical, 7)
+            .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 10))
+            Text("额度看板图标").font(.footnote).foregroundStyle(.secondary)
+        }.accessibilityElement(children: .ignore)
+            .accessibilityLabel("菜单栏示意，柱状图图标是额度看板入口")
+    }
+
+    private var quotaExample: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("示例额度").font(.footnote.weight(.medium)).foregroundStyle(.secondary)
+            HStack(spacing: 36) {
+                quotaSample(.codex, remaining: 68, period: "5 Hours")
+                quotaSample(.cursor, remaining: 84, period: "Weekly")
+            }.frame(maxWidth: .infinity)
+        }
+        .padding(16)
+        .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    private func quotaSample(_ provider: QuotaProvider, remaining: Double, period: String) -> some View {
+        VStack(spacing: 5) {
+            HStack(spacing: 5) {
+                BrandMark(provider: provider, size: 15)
+                Text(provider.rawValue).font(.subheadline.weight(.semibold))
+            }
+            QuotaRing(remaining: remaining, tint: provider.tint(for: colorScheme), size: 46)
+            Text(period).font(.footnote).foregroundStyle(.secondary)
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(provider.rawValue)，\(period)，剩余 \(Int(remaining))%")
+    }
+
+    private var accounts: some View {
+        VStack(alignment: .leading, spacing: 11) {
+            accountRow(.codex, "用 Codex CLI 登录到 ~/.codex-n。其他账号可用 ~/.codex-b 和 ~/.codex-w。")
+            accountRow(.kiro, "用 Kiro CLI 登录到 ~/Library/Application Support/Kiro CLI Accounts/1。")
+            accountRow(.cursor, "在 Cursor 客户端登录，打开看板中的 Cursor 详情并刷新。")
+            accountRow(.gemini, "在 Chrome、Edge 或 Brave 登录 Google，打开 Gemini 详情并刷新。")
+            Text("读取 Cursor 或 Gemini 时，macOS 可能会显示钥匙串授权提示。")
+                .font(.footnote).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }.frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func accountRow(_ provider: QuotaProvider, _ description: String) -> some View {
+        HStack(alignment: .top, spacing: 9) {
+            BrandMark(provider: provider, size: 16)
+            Text(provider.rawValue).font(.subheadline.weight(.semibold))
+                .frame(width: 53, alignment: .leading)
+            Text(description).font(.subheadline).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+}
+
 private struct MenuBoardView: View {
     @ObservedObject var store: BoardStore
     let provider: QuotaProvider?
     let switchGemini: (QuotaCard) -> Void
+    let showGuide: () -> Void
     let navigate: (QuotaProvider?) -> Void
 
     private var lastUpdate: Date? { store.lastRefresh ?? store.cards.compactMap { parseDate($0.updatedAt) }.max() }
@@ -727,6 +867,13 @@ private struct MenuBoardView: View {
             else if let message = store.processMessage { Text(message).lineLimit(1) }
             else if !allReady && !store.refreshing { Text("待更新") }
             Spacer()
+            Button(action: showGuide) {
+                Image(systemName: "questionmark.circle")
+                    .font(.system(size: 12, weight: .medium))
+                    .frame(width: 26, height: 26)
+                    .contentShape(Circle())
+            }.buttonStyle(.plain)
+                .help("新手引导").accessibilityLabel("新手引导")
             Button(action: refresh) {
                 Group {
                     if store.refreshing {
@@ -815,8 +962,10 @@ private final class FrostedBackdrop: NSVisualEffectView {
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+    private static let guideSeenKey = "HasSeenGettingStarted"
     private var statusItem: NSStatusItem!
     private var panel: QuotaPanel?
+    private var guideWindow: NSWindow?
     private var store: BoardStore!
     private var switchingGemini = false
     private var geminiVerification: Task<Void, Never>?
@@ -845,11 +994,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         statusItem.button?.action = #selector(statusClicked)
         statusItem.button?.sendAction(on: [.leftMouseUp])
 
-        store.refresh()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
-            guard let self, !self.openingGeminiFromShortcut else { return }
-            self.showPanel()
+            guard let self else { return }
+            if self.openingGeminiFromShortcut {
+                self.store.startRefreshing()
+            } else if self.panel == nil && self.guideWindow == nil {
+                self.openInitialView()
+            }
         }
+    }
+
+    private func openInitialView() {
+        if guideWindow != nil || !UserDefaults.standard.bool(forKey: Self.guideSeenKey) {
+            showGuide()
+        } else {
+            store.startRefreshing()
+            showPanel()
+        }
+    }
+
+    private func showGuide() {
+        hidePanel()
+        if let guideWindow {
+            NSApp.activate(ignoringOtherApps: true)
+            guideWindow.makeKeyAndOrderFront(nil)
+            return
+        }
+        let guide = GettingStartedView(
+            skip: { [weak self] in self?.guideWindow?.close() },
+            finish: { [weak self] in self?.guideWindow?.close() }
+        )
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 500, height: 430),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "额度看板 · 新手引导"
+        window.isReleasedWhenClosed = false
+        window.delegate = self
+        window.contentView = NSHostingView(rootView: guide)
+        window.center()
+        guideWindow = window
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
     }
 
     private func frame(for provider: QuotaProvider?) -> NSRect? {
@@ -905,11 +1093,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         let bounds = NSRect(origin: .zero, size: frame.size)
         let backdrop = FrostedBackdrop(frame: bounds)
-        let host = NSHostingView(rootView: MenuBoardView(store: store, provider: provider, switchGemini: { [weak self] in
-            self?.switchGeminiDesktop($0)
-        }) { [weak self] page in
-            self?.navigate(to: page)
-        })
+        let host = NSHostingView(rootView: MenuBoardView(
+            store: store,
+            provider: provider,
+            switchGemini: { [weak self] in self?.switchGeminiDesktop($0) },
+            showGuide: { [weak self] in self?.showGuide() },
+            navigate: { [weak self] page in self?.navigate(to: page) }
+        ))
         host.sizingOptions = []
         host.frame = bounds
         host.autoresizingMask = [.width, .height]
@@ -1064,7 +1254,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     @objc private func statusClicked() {
-        if panel?.isVisible == true { hidePanel() } else { showPanel() }
+        if panel?.isVisible == true { hidePanel() } else { openInitialView() }
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow, window === guideWindow else { return }
+        guideWindow = nil
+        UserDefaults.standard.set(true, forKey: Self.guideSeenKey)
+        DispatchQueue.main.async { [weak self] in self?.openInitialView() }
     }
 
     func windowDidResignKey(_ notification: Notification) {
@@ -1072,7 +1269,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     func applicationDidChangeScreenParameters(_ notification: Notification) { hidePanel() }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        showPanel()
+        openInitialView()
         return true
     }
 
