@@ -4,19 +4,18 @@ import argparse
 import base64
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+import fcntl
 import hashlib
 import json
 import math
 import os
 from pathlib import Path
 import re
+import shutil
 import signal
 import sqlite3
 import subprocess
 import tempfile
-import time
-from urllib.parse import urlencode, urlsplit
-from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parent
 VENDOR = ROOT / "vendor"
@@ -35,13 +34,13 @@ CARDS = [
     ("kiro-3", "Kiro", "账号 3"),
     ("kiro-default", "Kiro", "当前登录账号"),
     ("cursor", "Cursor", "当前登录账号"),
-    ("gemini", "Gemini", "网页版 · Google AI Pro"),
 ]
 URLS = {
     "Codex": "https://chatgpt.com/codex/settings/usage",
     "Kiro": "https://app.kiro.dev/account/usage",
     "Cursor": "https://cursor.com/dashboard",
-    "Gemini": "https://gemini.google.com/usage",
+    "Claude": "https://claude.ai/settings/usage",
+    "GitHub Copilot": "https://github.com/settings/copilot",
 }
 
 
@@ -87,11 +86,87 @@ def claims(path):
 
 
 def codex_home(card_id):
+    if card_id.startswith("codex-profile-"):
+        return BOARD_DATA / "Profiles/Codex" / card_id.removeprefix("codex-profile-")
     return USER_HOME / (".codex" if card_id == "codex-default" else "." + card_id)
 
 
 def kiro_home(card_id):
     return USER_HOME if card_id == "kiro-default" else KIRO_ACCOUNTS / card_id.removeprefix("kiro-")
+
+
+def cursor_home(card_id):
+    if card_id == "cursor":
+        return USER_HOME / "Library/Application Support/Cursor"
+    return BOARD_DATA / "Profiles/Cursor" / card_id.removeprefix("cursor-profile-")
+
+
+def claude_home(card_id):
+    if card_id == "claude-default":
+        return USER_HOME / ".claude"
+    return BOARD_DATA / "Profiles/Claude" / card_id.removeprefix("claude-profile-")
+
+
+def profile_specs():
+    specs = CARDS + [("claude-default", "Claude", "Claude")]
+    for prefix, provider, directory, pattern in (
+        ("codex-profile-", "Codex", BOARD_DATA / "Profiles/Codex", r"[0-9a-f]{32,64}"),
+        ("kiro-", "Kiro", KIRO_ACCOUNTS, r"profile-[0-9a-f]{32}"),
+        ("claude-profile-", "Claude", BOARD_DATA / "Profiles/Claude", r"[0-9a-f]{32}"),
+        ("cursor-profile-", "Cursor", BOARD_DATA / "Profiles/Cursor", r"[0-9a-f]{32}"),
+    ):
+        if directory.is_dir():
+            specs += [(prefix + item.name, provider, provider + " 账号")
+                      for item in sorted(directory.iterdir()) if item.is_dir() and re.fullmatch(pattern, item.name)]
+    return specs
+
+
+def gh_environment():
+    env = environment("")
+    for key in ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "GH_HOST"):
+        env.pop(key, None)
+    env["GH_PROMPT_DISABLED"] = "1"
+    return env
+
+
+def github_accounts():
+    try:
+        status, output = run(["gh", "auth", "status", "--hostname", "github.com", "--json", "hosts"],
+                             gh_environment(), timeout=9)
+        if status != 0:
+            return []
+        return [row for row in json.loads(output).get("hosts", {}).get("github.com", [])
+                if valid_github_login(row.get("login", ""))]
+    except (OSError, ReadError, ValueError, AttributeError):
+        return []
+
+
+def valid_github_login(login):
+    return isinstance(login, str) and re.fullmatch(r"[A-Za-z0-9-]{1,39}", login) is not None
+
+
+def copilot_id(login):
+    return "copilot-" + login.casefold()
+
+
+def claude_status(card_id):
+    try:
+        status, output = run(["claude", "auth", "status"], environment(card_id), timeout=7)
+        result = json.loads(output)
+        if status == 0 and result.get("loggedIn") is True and result.get("authMethod") == "claude.ai":
+            return result
+    except (OSError, ReadError, ValueError, AttributeError):
+        pass
+    return {}
+
+
+def email_address(value):
+    return value.strip() if isinstance(value, str) and re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", value.strip()) else ""
+
+
+def claude_email(status):
+    return email_address(status.get("email")) or email_address(status.get("emailAddress"))
+
 
 
 def codex_email(card_id):
@@ -130,49 +205,61 @@ def kiro_signed_in(home):
         return False
 
 
-def active_accounts():
+def active_accounts(specs=None, providers=()):
+    specs = profile_specs() if specs is None else specs
     active = {}
-    try:
-        chosen = (BOARD_DATA / "active-gemini-account").read_text().strip()
-        if re.fullmatch(r"gemini-[0-9a-f]{64}", chosen):
-            active["Gemini"] = chosen
-    except (OSError, ValueError):
-        pass
     current_codex = claims(USER_HOME / ".codex/auth.json")
     if current_codex:
-        matches = [
-            f"codex-{slot}" for slot in ("n", "b", "w")
-            if claims(USER_HOME / f".codex-{slot}/auth.json") == current_codex
-        ]
-        if matches:
-            active["Codex"] = matches[0]
-        else:
-            active["Codex"] = "codex-default"
+        active["Codex"] = next((card_id for card_id, provider, _ in specs
+                               if provider == "Codex" and card_id != "codex-default"
+                               and claims(codex_home(card_id) / "auth.json") == current_codex), "codex-default")
 
-    slots = ("1", "2", "3")
     try:
         last_kiro = (KIRO_ACCOUNTS / "active-account").read_text().strip()
-    except (OSError, ValueError):
-        last_kiro = None
-    if last_kiro in slots and kiro_database(KIRO_ACCOUNTS / last_kiro).is_file():
-        active["Kiro"] = f"kiro-{last_kiro}"
-    else:
+    except OSError:
+        last_kiro = ""
+    if any(card_id == "kiro-" + last_kiro for card_id, _, _ in specs) and kiro_signed_in(KIRO_ACCOUNTS / last_kiro):
+        active["Kiro"] = "kiro-" + last_kiro
+    elif kiro_signed_in(USER_HOME):
         current_kiro = kiro_identity(USER_HOME)
-        if current_kiro:
-            matches = [slot for slot in slots if kiro_identity(KIRO_ACCOUNTS / slot) == current_kiro]
-            if matches:
-                active["Kiro"] = f"kiro-{matches[0]}"
-            else:
-                active["Kiro"] = "kiro-default"
-    if cursor_email():
+        active["Kiro"] = next((card_id for card_id, provider, _ in specs
+                               if provider == "Kiro" and card_id != "kiro-default" and current_kiro
+                               and kiro_identity(kiro_home(card_id)) == current_kiro), "kiro-default")
+    try:
+        chosen_cursor = (BOARD_DATA / "active-cursor-account").read_text().strip()
+    except OSError:
+        chosen_cursor = ""
+    if any(card_id == chosen_cursor for card_id, _, _ in specs) and cursor_email(chosen_cursor):
+        active["Cursor"] = chosen_cursor
+    elif cursor_email():
         active["Cursor"] = "cursor"
+    if "Claude" in providers:
+        try:
+            chosen = (BOARD_DATA / "active-claude-account").read_text().strip()
+        except OSError:
+            chosen = ""
+        if any(card_id == chosen for card_id, _, _ in specs) and claude_status(chosen):
+            active["Claude"] = chosen
+        elif claude_status("claude-default"):
+            active["Claude"] = "claude-default"
+    if "GitHub Copilot" in providers:
+        accounts = github_accounts()
+        current = next((row["login"] for row in accounts if row.get("active") and row.get("state") == "success"), None)
+        if current:
+            active["GitHub Copilot"] = copilot_id(current)
     return active
 
 
 def environment(card_id):
     env = dict(os.environ)
-    env["PATH"] = f"{USER_HOME}/.local/bin:/opt/homebrew/bin:/usr/local/bin:" + env.get("PATH", "")
-    for key in ("OPENAI_API_KEY", "KIRO_API_KEY", "CODEX_HOME", "KIRO_HOME", "KIRO_DATA_DIR"):
+    node_bins = sorted((USER_HOME / ".nvm/versions/node").glob("*/bin"),
+                       key=lambda path: tuple(int(n) for n in re.findall(r"\d+", path.parent.name)), reverse=True)
+    env["PATH"] = os.pathsep.join([str(USER_HOME / ".local/bin"), "/opt/homebrew/bin", "/usr/local/bin",
+                                  *map(str, node_bins), env.get("PATH", os.defpath)])
+    for key in ("OPENAI_API_KEY", "KIRO_API_KEY", "CODEX_HOME", "KIRO_HOME", "KIRO_DATA_DIR",
+                "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "CLAUDE_CODE_OAUTH_TOKEN",
+                "CODEXBAR_CLAUDE_OAUTH_TOKEN", "ANTHROPIC_ADMIN_KEY", "CLAUDE_CONFIG_DIR",
+                "CLAUDE_SECURESTORAGE_CONFIG_DIR", "COPILOT_API_TOKEN"):
         env.pop(key, None)
     env["KIRO_NO_AUTO_UPDATE"] = "1"
     env["KIRO_SKIP_BINARY_PINNING"] = "1"
@@ -191,17 +278,23 @@ def environment(card_id):
             raise ReadError("not_logged_in", "未找到此 Kiro 账号，请先登录")
         env["HOME"] = str(home)
         env["KIRO_HOME"] = str(home / ".kiro")
+    elif card_id.startswith("claude-profile-"):
+        env["CLAUDE_CONFIG_DIR"] = str(claude_home(card_id))
+        env["CLAUDE_SECURESTORAGE_CONFIG_DIR"] = env["CLAUDE_CONFIG_DIR"]
     return env
 
 
-def cursor_email():
-    path = USER_HOME / "Library/Application Support/Cursor/User/globalStorage/state.vscdb"
+def cursor_email(card_id="cursor"):
+    path = cursor_home(card_id) / "User/globalStorage/state.vscdb"
     if not path.is_file():
         return ""
     try:
         with sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=0.4) as db:
-            row = db.execute("SELECT value FROM ItemTable WHERE key='cursorAuth/cachedEmail'").fetchone()
-        return row[0] if row and isinstance(row[0], str) else ""
+            rows = dict(db.execute("SELECT key, value FROM ItemTable WHERE key IN ('cursorAuth/cachedEmail', 'cursorAuth/accessToken')"))
+        email = rows.get("cursorAuth/cachedEmail")
+        if isinstance(email, bytes):
+            email = email.decode("utf-8", errors="ignore").replace("\x00", "")
+        return email_address(email) if rows.get("cursorAuth/accessToken") else ""
     except sqlite3.Error:
         return ""
 
@@ -212,8 +305,14 @@ def identity_key(card_id):
             value = claims(codex_home(card_id) / "auth.json")
         elif card_id.startswith("kiro-"):
             value = kiro_identity(kiro_home(card_id))
-        elif card_id == "cursor":
-            value = cursor_email()
+        elif card_id == "cursor" or card_id.startswith("cursor-profile-"):
+            value = cursor_email(card_id)
+        elif card_id.startswith("claude-"):
+            status = claude_status(card_id)
+            email = claude_email(status)
+            value = (email.casefold(), status.get("orgId", status.get("organizationId"))) if email else None
+        elif card_id.startswith("copilot-") and valid_github_login(card_id[8:]):
+            value = card_id[8:].casefold()
         else:
             return None
         return hashlib.sha256(json.dumps(value).encode()).hexdigest() if value else None
@@ -221,27 +320,98 @@ def identity_key(card_id):
         return None
 
 
-def discover_accounts():
-    """List local account identifiers without fetching quotas or prompting for access."""
+def github_email(card_id):
+    env = github_token_environment(card_id)
+    try:
+        status, output = run(["gh", "api", "--hostname", "github.com", "user/emails"], env, timeout=9)
+        if status == 0:
+            return next((email_address(row.get("email")) for row in json.loads(output)
+                         if row.get("primary") and row.get("verified")), "")
+    except (OSError, ReadError, ValueError, AttributeError):
+        pass
+    return ""
+
+
+def github_token_environment(card_id):
+    env = gh_environment()
+    status, token = run(["gh", "auth", "token", "--hostname", "github.com", "--user", card_id[8:]], env, timeout=8)
+    if status != 0 or not token.strip():
+        raise ReadError("not_logged_in", "请在 GitHub 完成授权后重新扫描。")
+    env["GH_TOKEN"] = token.strip()
+    return env
+
+
+def kiro_email(card_id):
+    try:
+        status, output = run(["kiro-cli", "whoami", "--format", "json"], environment(card_id), timeout=6)
+        if status == 0:
+            email = email_address(json.loads(output).get("email"))
+            if email:
+                return email
+    except (OSError, ReadError, ValueError, AttributeError):
+        pass
+    try:
+        row, _ = request_kiro(card_id, retry=False)
+        return email_address(row["usage"]["identity"].get("accountEmail"))
+    except (ReadError, OSError, ValueError, sqlite3.Error, subprocess.SubprocessError):
+        return ""
+
+
+def discover_accounts(providers=None):
+    """Discover provider logins and resolve account identity before quota import."""
+    specs = profile_specs()
+    providers = set(URLS) if providers is None else providers
+    github = github_accounts() if "GitHub Copilot" in providers else []
+    specs += [(copilot_id(row["login"]), "GitHub Copilot", row["login"]) for row in github
+              if row.get("state") == "success"]
+    # Only duplicated local profiles need an active-account tie break.
+    active = active_accounts(specs)
     unique = {}
-    active = active_accounts()
-    for card_id, provider, label in CARDS:
-        if provider == "Gemini":
-            continue
+
+    def discover(spec):
+        card_id, provider, label = spec
         if provider == "Kiro" and not kiro_signed_in(kiro_home(card_id)):
-            continue
-        identity = identity_key(card_id)
-        if not identity:
-            continue
-        email = codex_email(card_id) if provider == "Codex" else cursor_email() if provider == "Cursor" else ""
-        key = (provider, identity)
-        if key not in unique or active.get(provider) == card_id:
-            unique[key] = {"id": card_id, "provider": provider, "label": label,
-                           "email": email, "identityKey": identity}
+            return None
+        if provider == "Claude":
+            status = claude_status(card_id)
+            email = claude_email(status)
+            if not email:
+                return None
+            key = (email.casefold(), status.get("orgId", status.get("organizationId")))
+            identity = hashlib.sha256(json.dumps(key).encode()).hexdigest()
+        else:
+            identity = identity_key(card_id)
+            if not identity:
+                return None
+            if provider == "Codex":
+                email = codex_email(card_id)
+            elif provider == "Cursor":
+                email = cursor_email(card_id)
+            elif provider == "Kiro":
+                email = kiro_email(card_id)
+            else:
+                try:
+                    email = github_email(card_id)
+                except (OSError, ReadError):
+                    email = ""
+        return {"id": card_id, "provider": provider, "label": label,
+                "email": email, "identityKey": identity}
+
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        for account in pool.map(discover, [spec for spec in specs if providers is None or spec[1] in providers]):
+            if account is None:
+                continue
+            key = (account["provider"], account["identityKey"])
+            existing = unique.get(key)
+            current_id = active.get(account["provider"])
+            if existing is None or account["id"] == current_id:
+                unique[key] = account
+            if existing and not unique[key]["email"]:
+                unique[key]["email"] = account["email"] or existing["email"]
     return list(unique.values())
 
 
-def auth_session(provider, interactive):
+def auth_session(provider, interactive, profile=None):
     access_file = USER_HOME / "Library/Application Support/QuotaBoard/access-enabled.json"
     try:
         enabled = json.loads(access_file.read_bytes())
@@ -250,6 +420,8 @@ def auth_session(provider, interactive):
     if not interactive and not enabled.get(provider):
         raise ReadError("keychain_required", "点「授权读取」，允许系统提供本机登录信息")
     command = [str(VENDOR / "QuotaAccess"), provider]
+    if profile is not None:
+        command.append(str(profile))
     if interactive:
         command.append("--interactive")
     status, output = run(command, dict(os.environ), timeout=120 if interactive else 12)
@@ -335,13 +507,6 @@ def request_kiro(card_id, retry=True):
     if isinstance(reset, (int, float)):
         reset = datetime.fromtimestamp(reset, timezone.utc).isoformat(timespec="seconds")
     email = (data.get("userInfo") or {}).get("email", "")
-    if not email:
-        try:
-            status, output = run(["kiro-cli", "whoami", "--format", "json"], env, timeout=10)
-            identity = json.loads(output) if status == 0 else {}
-            email = identity.get("email") or ""
-        except (ReadError, ValueError):
-            pass
     allowance = f"{max(0, limit - used):.2f} / {limit:g} 积分剩余"
     bonus_note = "（含服务合并的赠送积分）" if credit.get("bonuses") else ""
     return {
@@ -363,8 +528,20 @@ def cli_result(card_id, interactive):
     session = None
     provider_config = {"id": provider, "enabled": True}
     source = "cli"
-    if provider in ("cursor", "gemini"):
-        session = auth_session(provider, interactive)
+    if provider == "claude":
+        # The CLI owns this profile's login and refresh. Pass only its current token to the usage reader.
+        profile = claude_home(card_id) if card_id != "claude-default" else None
+        session = auth_session("claude", interactive, profile)
+        env["CODEXBAR_CLAUDE_OAUTH_TOKEN"] = session["token"]
+        if session.get("scopes"):
+            env["CODEXBAR_CLAUDE_OAUTH_SCOPES"] = ",".join(session["scopes"])
+        session = None
+        source = "oauth"
+    elif provider == "copilot":
+        env["COPILOT_API_TOKEN"] = github_token_environment(card_id)["GH_TOKEN"]
+        source = "api"
+    elif provider == "cursor":
+        session = auth_session(provider, interactive, cursor_home(card_id) if card_id != "cursor" else None)
         source = "web"
         provider_config.update(cookieSource="manual", cookieHeader=session["cookie"], source=source)
     # The manual session exists only in this private, short-lived configuration.
@@ -408,225 +585,6 @@ def public_error(message, provider):
     return ReadError("read_failed", "暂时无法读取额度，请打开官方用量页面核对")
 
 
-GEMINI_ORIGIN = "https://gemini.google.com"
-GEMINI_MAX_SLOTS = 12
-GEMINI_QUERY = urlencode({
-    "query_signature": "2/dWbCvkVB0X16r9NPnxifeOAAqdCqMf0xeWvau9yPy7g=",
-    "variables": json.dumps({
-        "g1Request": {"entrypoints": ["GEMINI_USAGE_SETTINGS_UPGRADE_BANNER"]},
-        "workspaceRequest": {"recommendationsForSurfaceRequests": []},
-    }, separators=(",", ":")),
-})
-
-
-def gemini_get(session, path):
-    # Never follow a redirect: Google may redirect an empty slot to the default account.
-    request = "url = " + json.dumps(GEMINI_ORIGIN + path) + "\n"
-    request += "header = " + json.dumps("Cookie: " + session["cookie"]) + "\n"
-    result = subprocess.run([
-        "/usr/bin/curl", "--silent", "--http1.1", "--compressed",
-        "--connect-timeout", "5", "--max-time", "12", "--retry", "1",
-        "--retry-max-time", "14", "--config", "-", "--write-out", "\n%{http_code}\t%{redirect_url}",
-    ], input=request, text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    body, _, metadata = result.stdout.rpartition("\n")
-    status, _, redirect = metadata.partition("\t")
-    if result.returncode or status == "000" or status.startswith("5"):
-        raise ReadError("network", "Gemini 暂时无法连接，保留上次结果")
-    if status == "429":
-        raise ReadError("rate_limited", "Gemini 限制了刷新频率，请稍后再试")
-    return status, body, redirect
-
-
-def gemini_slot_usage(session, slot):
-    path = f"/u/{slot}/_/BardChatUi/graphql/schemas/GEMINI_WEB_GRAPHQL/executeQuery?{GEMINI_QUERY}"
-    status, body, redirect = gemini_get(session, path)
-    if status.startswith("3"):
-        location = urlsplit(redirect)
-        if slot > 0 and location.netloc == "gemini.google.com" and location.path.startswith("/u/0/"):
-            return None
-        if location.netloc == "accounts.google.com":
-            raise ReadError("not_logged_in", "请在浏览器重新登录 Gemini")
-    if status in ("401", "403"):
-        raise ReadError("not_logged_in", "请在浏览器重新登录 Gemini")
-    if status != "200":
-        raise ReadError("read_failed", "Gemini 暂未返回可读取的账号信息")
-    try:
-        raw = json.loads(body.strip().removeprefix(")]}'").lstrip())
-        info = next(item["data"]["viewer"]["rpcs"]["getUsageInfo"] for item in raw
-                    if isinstance(item, dict) and isinstance(item.get("data"), dict)
-                    and isinstance(item["data"].get("viewer"), dict)
-                    and isinstance(item["data"]["viewer"].get("rpcs"), dict)
-                    and isinstance(item["data"]["viewer"]["rpcs"].get("getUsageInfo"), dict))
-    except (ValueError, StopIteration, TypeError, KeyError):
-        raise ReadError("format_changed", "Gemini 的用量响应未能识别") from None
-    return info
-
-
-def gemini_slot_identity(session, slot):
-    status, body, _ = gemini_get(session, f"/u/{slot}/usage")
-    if status != "200":
-        raise ReadError("not_logged_in", "Gemini 登录已变化，请刷新后再切换")
-    start = re.search(r"\bWIZ_global_data\s*=\s*(?=\{)", body)
-    try:
-        payload = json.JSONDecoder().raw_decode(body, start.end())[0] if start else {}
-        email = payload.get("oPEP7c", "")
-    except (ValueError, AttributeError):
-        email = ""
-    if not isinstance(email, str) or not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
-        raise ReadError("format_changed", "Gemini 暂未提供可核对的账号邮箱")
-    return "gemini-" + hashlib.sha256(email.casefold().encode()).hexdigest(), email
-
-
-def gemini_web_route(session, slot):
-    browser, separator, profile = session.get("profile", "").partition(" / ")
-    if not separator or browser not in ("Chrome", "Edge", "Brave") or not re.fullmatch(r"Default|Profile [0-9]+", profile):
-        raise ReadError("read_failed", "未找到可打开的 Gemini 浏览器配置")
-    return {"browser": browser, "profile": profile, "slot": slot}
-
-
-def gemini_account_card(session, slot, info):
-    account_id, email = gemini_slot_identity(session, slot)
-    windows = []
-    pools = info.get("pools")
-    if not isinstance(pools, list):
-        pools = []
-    for pool_type, title in (("GXU_FIVE_HOURLY", "5 小时"), ("GXU_WEEKLY", "每周")):
-        pool = next((p for p in pools if isinstance(p, dict) and p.get("poolType") == pool_type), {})
-        used = pool.get("percentageUsed")
-        if not isinstance(used, (float, int)) or isinstance(used, bool) or not math.isfinite(used) or used < 0:
-            continue
-        period = pool.get("gxu")
-        reset = period.get("windowRefreshesAt") if isinstance(period, dict) else None
-        windows.append({"title": title, "remaining": 100 * (1 - min(1, used)),
-                        "resetsAt": reset if isinstance(reset, str) else None, "detail": None,
-                        "minutes": 300 if pool_type == "GXU_FIVE_HOURLY" else 10080})
-    pro = info.get("subscriptionTier") == "TIER1"
-    return {
-        "id": account_id, "provider": "Gemini", "label": f"Gemini {slot + 1}",
-        "email": email, "plan": "Google AI Pro" if pro else "Gemini",
-        "status": "ok" if windows else "error",
-        "message": None if windows else "此账号尚未提供可读取的额度窗口",
-        "windows": windows, "details": [], "updatedAt": now() if windows else None,
-        "source": session["profile"], "url": f"{GEMINI_ORIGIN}/u/{slot}/usage",
-        "errorCode": None if windows else "unavailable",
-        "identityKey": account_id, "geminiRoute": gemini_web_route(session, slot),
-    }
-
-
-def read_gemini_accounts(interactive, selected_ids=None):
-    session = auth_session("gemini", interactive)
-    if selected_ids is not None:
-        cards = []
-        for slot, (account_id, _) in gemini_identities(session):
-            if account_id in selected_ids:
-                info = gemini_slot_usage(session, slot)
-                if info is not None:
-                    card = gemini_account_card(session, slot, info)
-                    if card["id"] == account_id:
-                        cards.append(card)
-        return cards
-    slots = []
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        exhausted = False
-        for start in range(0, GEMINI_MAX_SLOTS, 4):
-            batch = pool.map(lambda slot: gemini_slot_usage(session, slot), range(start, start + 4))
-            for slot, info in enumerate(batch, start):
-                if info is None:
-                    exhausted = True
-                    break
-                slots.append((slot, info))
-            if exhausted:
-                break
-        selected = [(slot, item) for slot, item in slots if item.get("subscriptionTier") == "TIER1"] or slots[:1]
-        if not selected:
-            raise ReadError("not_logged_in", "请在浏览器登录 Gemini 后刷新")
-        cards = list(pool.map(lambda pair: gemini_account_card(session, *pair), selected))
-    unique = {}
-    for card in cards:
-        unique.setdefault(card["id"], card)
-    return list(unique.values())
-
-
-def gemini_identities(session):
-    seen = set()
-    for slot in range(GEMINI_MAX_SLOTS):
-        try:
-            identity = gemini_slot_identity(session, slot)
-        except ReadError as error:
-            if slot and error.code in ("not_logged_in", "format_changed"):
-                break
-            raise
-        if identity[0] in seen:
-            break
-        seen.add(identity[0])
-        yield slot, identity
-
-
-def discover_gemini_accounts():
-    session = auth_session("gemini", True)
-    return [{"id": account_id, "provider": "Gemini", "label": f"Gemini {slot + 1}",
-             "email": email, "identityKey": account_id, "geminiRoute": gemini_web_route(session, slot)}
-            for slot, (account_id, email) in gemini_identities(session)]
-
-
-def open_gemini_account(account_id, slot, page):
-    session = auth_session("gemini", False)
-    try:
-        matched = gemini_slot_identity(session, slot)[0] == account_id
-    except ReadError as error:
-        if error.code == "network":
-            raise
-        matched = False
-    if not matched:
-        match = next((c for c in read_gemini_accounts(False) if c["id"] == account_id), None)
-        if match is None:
-            raise ReadError("account_changed", "找不到此 Gemini 账号，请确认浏览器已登录后刷新")
-        route = match["geminiRoute"]
-    else:
-        route = gemini_web_route(session, slot)
-    executables = {"Chrome": ("Google Chrome.app", "Google Chrome"),
-                   "Edge": ("Microsoft Edge.app", "Microsoft Edge"),
-                   "Brave": ("Brave Browser.app", "Brave Browser")}
-    app, binary = executables[route["browser"]]
-    executable = next((root / app / "Contents/MacOS" / binary
-                       for root in (Path("/Applications"), USER_HOME / "Applications")
-                       if (root / app / "Contents/MacOS" / binary).is_file()), None)
-    if not executable:
-        raise ReadError("browser_missing", "找不到此账号使用的浏览器")
-    url = f'{GEMINI_ORIGIN}/u/{route["slot"]}/{page}'
-    try:
-        subprocess.Popen([str(executable), f'--profile-directory={route["profile"]}', url],
-                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                         stderr=subprocess.DEVNULL, start_new_session=True)
-    except OSError:
-        raise ReadError("browser_launch", "浏览器未能打开，请稍后重试") from None
-    BOARD_DATA.mkdir(parents=True, exist_ok=True, mode=0o700)
-    with tempfile.NamedTemporaryFile(dir=BOARD_DATA, delete=False) as marker:
-        target = Path(marker.name)
-        try:
-            marker.write(account_id.encode() + b"\n")
-            marker.flush()
-            os.replace(target, BOARD_DATA / "active-gemini-account")
-        finally:
-            target.unlink(missing_ok=True)
-
-
-def request_gemini_desktop(account_id):
-    bundle = ROOT.parent.parent
-    if ROOT.name != "Resources" or ROOT.parent.name != "Contents" or bundle.suffix != ".app":
-        raise ReadError("board_missing", "请使用额度看板应用内的切换入口")
-    requests = BOARD_DATA / "gemini-desktop-requests"
-    requests.mkdir(parents=True, exist_ok=True, mode=0o700)
-    request = requests / f"{uuid4()}.json"
-    request.write_text(json.dumps({"accountID": account_id, "createdAt": time.time()}), encoding="utf-8")
-    try:
-        subprocess.run(["/usr/bin/open", "-a", str(bundle), str(request)], check=True, timeout=12,
-                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except (OSError, subprocess.SubprocessError):
-        request.unlink(missing_ok=True)
-        raise ReadError("board_launch", "未能打开额度看板，请从菜单栏重试") from None
-
-
 def normalize(card_id, provider, label, row, session=None):
     usage = row.get("usage") or {}
     labels = row.get("rateWindowLabels") or {}
@@ -639,7 +597,10 @@ def normalize(card_id, provider, label, row, session=None):
         if isinstance(used, bool) or not isinstance(used, (int, float)) or not math.isfinite(used) or used < 0:
             continue
         minutes = window.get("windowMinutes")
-        if minutes == 300:
+        if provider == "GitHub Copilot":
+            title = "Premium · Monthly" if key == "primary" else "Chat · Monthly"
+            minutes = minutes or 43200
+        elif minutes == 300:
             title = "5 小时"
         elif minutes == 10080:
             title = "每周"
@@ -669,9 +630,17 @@ def normalize(card_id, provider, label, row, session=None):
         raise ReadError("unavailable", "服务未返回可量化的剩余额度")
     identity = usage.get("identity") or {}
     plan = (usage.get("planObservation") or {}).get("rawPlan") or usage.get("loginMethod") or identity.get("loginMethod") or ""
-    email = usage.get("accountEmail") or identity.get("accountEmail") or (session or {}).get("email") or ""
+    email = email_address(usage.get("accountEmail")) or email_address(identity.get("accountEmail")) \
+        or email_address((session or {}).get("email"))
     if provider == "Codex" and not email:
         email = codex_email(card_id)
+    if provider == "Cursor" and email and email.casefold() != cursor_email(card_id).casefold():
+        raise ReadError("account_changed", "Cursor 登录已变化，请重新扫描。")
+    if provider == "Claude":
+        expected = claude_email(claude_status(card_id))
+        if not expected or (email and email.casefold() != expected.casefold()):
+            raise ReadError("account_changed", "Claude 额度所对应的账号无法核对，请重新登录。")
+        email = expected
     details = []
     for section in usage.get("details") or []:
         for item in section.get("rows") or []:
@@ -705,7 +674,7 @@ def read_card(spec, interactive):
         code, message = "read_failed", "读取失败，请稍后刷新"
     return {
         "id": card_id, "provider": provider, "label": label,
-        "plan": "Google AI Pro · 你设置的套餐" if provider == "Gemini" else provider,
+        "plan": provider,
         "email": codex_email(card_id) if provider == "Codex" else "",
         "status": "error", "message": message, "windows": [], "details": [],
         "updatedAt": None, "source": "等待读取", "url": URLS[provider], "errorCode": code,
@@ -713,69 +682,178 @@ def read_card(spec, interactive):
     }
 
 
+def atomic_write(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as file:
+        temporary = Path(file.name)
+        try:
+            file.write(data)
+            file.flush()
+            os.fsync(file.fileno())
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+def login(provider, profile, check=False):
+    env = environment("")
+    if not re.fullmatch(r"[0-9a-f]{32}", profile):
+        raise ReadError("invalid_profile", "无法建立登录配置。")
+    if provider == "Codex":
+        home = codex_home("codex-profile-" + profile)
+        env["CODEX_HOME"] = str(home)
+        command = ["codex", "login", "-c", 'cli_auth_credentials_store="file"']
+    elif provider == "Kiro":
+        home = kiro_home("kiro-profile-" + profile)
+        env["HOME"] = str(home)
+        env["KIRO_HOME"] = str(home / ".kiro")
+        command = ["kiro-cli", "login"]
+    elif provider == "Claude":
+        home = claude_home("claude-profile-" + profile)
+        env["CLAUDE_CONFIG_DIR"] = str(home)
+        env["CLAUDE_SECURESTORAGE_CONFIG_DIR"] = str(home)
+        command = ["claude", "auth", "login", "--claudeai"]
+    elif provider == "GitHub Copilot":
+        env = gh_environment()
+        env.pop("GH_PROMPT_DISABLED", None)
+        command = ["gh", "auth", "login", "--hostname", "github.com", "--web", "--scopes", "user:email", "--skip-ssh-key"]
+    else:
+        raise ReadError("invalid_provider", "请在 Cursor 桌面应用中登录。")
+    if not shutil.which(command[0], path=env["PATH"]):
+        raise ReadError("cli_missing", f"请先安装 {command[0]}，再回到额度看板添加账号。")
+    if check:
+        return 0
+    if provider != "GitHub Copilot":
+        home.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return subprocess.call(command, env=env)
+
+
+def switch_account(card_id, expected):
+    specs = profile_specs()
+    provider = next((p for i, p, _ in specs if i == card_id), None)
+    if provider is None and card_id.startswith("copilot-") and valid_github_login(card_id[8:]):
+        provider = "GitHub Copilot"
+    if provider is None or identity_key(card_id) != expected:
+        raise ReadError("account_changed", "登录账号已变化，请在设置中重新导入。")
+    if provider == "Codex":
+        BOARD_DATA.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with (BOARD_DATA / ".codex-switch.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            return switch_codex(card_id, expected, specs)
+    if provider == "GitHub Copilot":
+        status, _ = run(["gh", "auth", "switch", "--hostname", "github.com", "--user", card_id[8:]],
+                        gh_environment(), timeout=10)
+        if status != 0:
+            raise ReadError("switch_failed", "GitHub 切换失败，请重新授权此账号。")
+        return {}
+    if provider == "Cursor":
+        atomic_write(BOARD_DATA / "active-cursor-account", card_id.encode())
+        return {}
+    if provider in ("Kiro", "Claude"):
+        if provider == "Kiro":
+            if not kiro_signed_in(kiro_home(card_id)):
+                raise ReadError("not_logged_in", "请先重新登录此 Kiro 账号。")
+            marker = KIRO_ACCOUNTS / "active-account"
+            selected = "" if card_id == "kiro-default" else card_id.removeprefix("kiro-")
+            command = ["kiro-cli", "chat"]
+        else:
+            marker = BOARD_DATA / "active-claude-account"
+            selected = card_id
+            command = ["claude"]
+        if not shutil.which(command[0], path=environment(card_id)["PATH"]):
+            raise ReadError("cli_missing", f"请先安装 {command[0]}。")
+        # Swift opens this exact profile in a new Terminal session.
+        atomic_write(marker, selected.encode())
+        return {"launch": True}
+    raise ReadError("switch_unavailable", "请在 Cursor 桌面应用中切换登录。")
+
+
+def switch_codex(card_id, expected, specs):
+    default = codex_home("codex-default") / "auth.json"
+    target = codex_home(card_id) / "auth.json"
+    target_data = target.read_bytes()
+    if identity_key(card_id) != expected or target.read_bytes() != target_data:
+        raise ReadError("account_changed", "目标登录已变化，请重新扫描。")
+    try:
+        current_data = default.read_bytes()
+    except FileNotFoundError:
+        current_data = None
+    current = identity_key("codex-default")
+    if current == expected:
+        return {}
+    if current is None and current_data is not None:
+        raise ReadError("switch_failed", "现有 Codex 登录格式无法核对，请先在 Codex 里退出或重新登录。")
+    result = {}
+    if current is not None and current_data is not None:
+        saved_id = next((other for other, provider, _ in specs if provider == "Codex"
+                         and other != "codex-default" and identity_key(other) == current),
+                        "codex-profile-" + current)
+        atomic_write(codex_home(saved_id) / "auth.json", current_data)
+        result["previousID"] = saved_id
+        result["previousIdentity"] = current
+    if current_data is not None and default.read_bytes() != current_data:
+        raise ReadError("account_changed", "当前 Codex 登录在切换时变化，请重试。")
+    if current_data is None and default.exists():
+        raise ReadError("account_changed", "当前 Codex 登录在切换时变化，请重试。")
+    atomic_write(default, target_data)
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--account")
     parser.add_argument("--interactive", action="store_true")
     parser.add_argument("--json", action="store_true")
-    parser.add_argument("--active", action="store_true", help="read local account selection without fetching quotas")
-    parser.add_argument("--discover", choices=("local", "gemini"))
+    parser.add_argument("--active", nargs="*", metavar="PROVIDER")
+    parser.add_argument("--discover", nargs="*", metavar="PROVIDER")
     parser.add_argument("--selected", help="JSON mapping of selected account IDs to their expected identities")
-    parser.add_argument("--gemini-open")
-    parser.add_argument("--gemini-desktop")
-    parser.add_argument("--slot", type=int)
-    parser.add_argument("--page", choices=("app", "usage"), default="app")
+    parser.add_argument("--login", nargs=2, metavar=("PROVIDER", "PROFILE"))
+    parser.add_argument("--switch", nargs=2, metavar=("ACCOUNT", "IDENTITY"))
+    parser.add_argument("--launch")
+    parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
     os.umask(0o077)
-    if args.active:
-        print(json.dumps(active_accounts()))
+    if args.active is not None:
+        print(json.dumps(active_accounts(providers=args.active)))
         return
-    if args.discover:
+    if args.discover is not None:
         try:
-            accounts = discover_accounts() if args.discover == "local" else discover_gemini_accounts()
-            print(json.dumps({"accounts": accounts}, ensure_ascii=False))
-        except ReadError as error:
-            print(json.dumps({"message": str(error)}, ensure_ascii=False))
+            providers = [name for name in args.discover if name in URLS]
+            print(json.dumps({"accounts": discover_accounts(providers or None)}, ensure_ascii=False))
         except (OSError, ValueError, subprocess.SubprocessError):
             print(json.dumps({"message": "暂时无法扫描账号，请稍后重试。"}, ensure_ascii=False))
         return
-    if args.gemini_desktop:
-        if not re.fullmatch(r"gemini-[0-9a-f]{64}", args.gemini_desktop):
-            parser.error("invalid Gemini account ID")
+    if args.login or args.launch:
         try:
-            request_gemini_desktop(args.gemini_desktop)
-            print(json.dumps({"requested": True}))
+            if args.login:
+                raise SystemExit(login(*args.login, check=args.check))
+            spec = next((spec for spec in profile_specs() if spec[0] == args.launch), None)
+            commands = {"Kiro": ["kiro-cli", "chat"], "Claude": ["claude"]}
+            if spec is None or spec[1] not in commands:
+                raise ReadError("invalid_profile", "未找到此账号。")
+            raise SystemExit(subprocess.call(commands[spec[1]], env=environment(args.launch)))
+        except (ReadError, OSError) as error:
+            print(str(error) if isinstance(error, ReadError) else "无法启动登录，请检查客户端是否已安装。")
+            raise SystemExit(1) from None
+    if args.switch:
+        try:
+            print(json.dumps({"switched": True, **switch_account(*args.switch)}, ensure_ascii=False))
         except ReadError as error:
             print(json.dumps({"message": str(error)}, ensure_ascii=False))
-        except OSError:
-            print(json.dumps({"message": "未能写入 Gemini 切换请求"}, ensure_ascii=False))
-        return
-    if args.gemini_open:
-        if not re.fullmatch(r"gemini-[0-9a-f]{64}", args.gemini_open) or args.slot is None or not 0 <= args.slot < GEMINI_MAX_SLOTS:
-            parser.error("invalid Gemini account slot")
-        try:
-            open_gemini_account(args.gemini_open, args.slot, args.page)
-            print(json.dumps({"opened": True}))
-        except ReadError as error:
-            print(json.dumps({"message": str(error)}, ensure_ascii=False))
-        except OSError:
-            print(json.dumps({"message": "未能保存当前 Gemini 账号"}, ensure_ascii=False))
+        except (OSError, ValueError, subprocess.SubprocessError):
+            print(json.dumps({"message": "切换失败，请检查登录状态后重试。"}, ensure_ascii=False))
         return
     selected = json.loads(args.selected) if args.selected is not None else None
-    gemini_ids = None if selected is None else {
-        key for key, identity in selected.items() if key.startswith("gemini-") and key == identity
-    }
-    requested = [item for item in CARDS if (not args.account or item[0] == args.account) and (
-        selected is None or item[0] in selected or (item[0] == "gemini" and gemini_ids)
-    )]
+    specs = profile_specs()
+    specs += [(card_id, "GitHub Copilot", card_id[8:]) for card_id in (selected or {})
+              if card_id.startswith("copilot-") and valid_github_login(card_id[8:])]
+    requested = [spec for spec in specs if (not args.account or spec[0] == args.account)
+                 and (selected is None or spec[0] in selected)]
     if not requested:
         parser.error("unknown account")
-    # One native prompt at a time. Background quota reads never request Keychain UI.
-    if args.interactive and (len(requested) != 1 or requested[0][0] not in ("cursor", "gemini")):
-        parser.error("interactive access requires one browser-based account")
+    if args.interactive and (len(requested) != 1 or requested[0][1] not in ("Cursor", "Claude")):
+        parser.error("interactive access requires a Cursor or Claude account")
     results = {}
-    gemini_cards = []
-    gemini_error = None
     def read_selected(spec):
         card_id, provider, label = spec
         if selected is None:
@@ -790,29 +868,15 @@ def main():
                 "errorCode": "account_changed"}
 
     with ThreadPoolExecutor(max_workers=4) as pool:
-        jobs = {
-            (pool.submit(read_gemini_accounts, args.interactive, gemini_ids) if spec[0] == "gemini"
-             else pool.submit(read_selected, spec)): spec[0] for spec in requested
-        }
+        jobs = [pool.submit(read_selected, spec) for spec in requested]
         for future in as_completed(jobs):
-            if jobs[future] == "gemini":
-                try:
-                    gemini_cards = future.result()
-                except ReadError as error:
-                    gemini_error = {"code": error.code, "message": str(error)}
-                except Exception:
-                    gemini_error = {"code": "read_failed", "message": "Gemini 账号读取失败，请稍后刷新"}
-                if not args.json:
-                    payload = {"geminiCards": gemini_cards} if gemini_error is None else {"geminiError": gemini_error}
-                    print(json.dumps(payload, ensure_ascii=False), flush=True)
-                continue
             card = future.result()
             results[card["id"]] = card
             if not args.json:
                 print(json.dumps({"card": card}, ensure_ascii=False), flush=True)
-    ordered = [results[item[0]] for item in requested if item[0] in results] + gemini_cards
+    ordered = [results[item[0]] for item in requested if item[0] in results]
     if args.json:
-        print(json.dumps({"cards": ordered, "geminiError": gemini_error, "updatedAt": now()}, ensure_ascii=False))
+        print(json.dumps({"cards": ordered, "updatedAt": now()}, ensure_ascii=False))
     else:
         print(json.dumps({"done": True, "updatedAt": now()}), flush=True)
 

@@ -16,8 +16,8 @@ fi
 stage="$(mktemp -d /private/tmp/quota-board-build.XXXXXX)"
 trap 'rm -rf "$stage"' EXIT
 /usr/bin/swiftc -swift-version 5 -O -module-cache-path /private/tmp/quota-board-module-cache \
-  "$root/src/QuotaBoard.swift" "$root/src/AccountSetup.swift" "$root/src/GeminiDesktop.swift" -o "$stage/QuotaBoard" \
-  -framework AppKit -framework SwiftUI -framework ApplicationServices
+  "$root/src/QuotaBoard.swift" "$root/src/AccountSetup.swift" -o "$stage/QuotaBoard" \
+  -framework AppKit -framework SwiftUI
 # 保留已有授权组件；源码更新时才重新编译。
 if [ ! -x "$vendor/QuotaAccess" ] || [ "$root/src/QuotaAccess.swift" -nt "$vendor/QuotaAccess" ]; then
   /usr/bin/swiftc -O -module-cache-path /private/tmp/quota-board-module-cache "$root/src/QuotaAccess.swift" -o "$stage/QuotaAccess" -framework Security -lsqlite3
@@ -27,6 +27,7 @@ fi
 mv "$stage/QuotaBoard" "$bundle/Contents/MacOS/QuotaBoard"
 cp "$root/src/worker.py" "$resources/worker.py"
 cp "$root/CodexBar-LICENSE" "$resources/CodexBar-LICENSE"
+rm -f "$resources/BrandIcons/gemini.svg"
 mkdir -p "$resources/BrandIcons"
 cp "$root/src/BrandIcons/"* "$resources/BrandIcons/"
 cat > "$bundle/Contents/Info.plist" <<'PLIST'
@@ -38,8 +39,8 @@ cat > "$bundle/Contents/Info.plist" <<'PLIST'
 <key>CFBundleName</key><string>额度看板</string>
 <key>CFBundleDisplayName</key><string>额度看板</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>1.5.3</string>
-<key>CFBundleVersion</key><string>14</string>
+<key>CFBundleShortVersionString</key><string>1.5.4</string>
+<key>CFBundleVersion</key><string>15</string>
 <key>LSMinimumSystemVersion</key><string>26.0</string>
 <key>LSUIElement</key><true/>
 <key>NSHighResolutionCapable</key><true/>

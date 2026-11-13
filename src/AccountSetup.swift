@@ -12,8 +12,10 @@ struct AccountSetupView: View {
     @State private var services: Set<QuotaProvider> = []
     @State private var candidates: [ImportAccount] = []
     @State private var checked: Set<String> = []
-    @State private var scanning: String?
+    @State private var enteredEmails: [String: String] = [:]
+    @State private var scanning = false
     @State private var message: String?
+    @State private var addingProvider: QuotaProvider?
     @State private var showingEmptyConfirmation = false
 
     private var selectedServices: [QuotaProvider] { QuotaProvider.allCases.filter(services.contains) }
@@ -38,13 +40,13 @@ struct AccountSetupView: View {
                     Button("取消", action: cancel).keyboardShortcut(.cancelAction)
                 }
                 Spacer()
-                if step > 1 {
-                    Button("上一步") { step -= 1 }.disabled(scanning != nil)
+                if step > (initialProvider == nil ? 1 : 2) {
+                    Button("上一步") { step -= 1 }.disabled(scanning)
                 }
                 Button(step == 3 ? (firstRun ? "导入并打开总览" : "保存账号") : "下一步", action: advance)
                     .buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
-                    .disabled(scanning != nil || (step == 1 && services.isEmpty) || (step == 2 && firstRun && finalSelection.isEmpty))
-            }.disabled(scanning != nil)
+                    .disabled(scanning || (step == 1 && services.isEmpty) || (step == 2 && ((firstRun && finalSelection.isEmpty) || needsEmail)))
+            }.disabled(scanning)
         }
         .padding(24)
         .frame(width: 556, height: 478)
@@ -52,6 +54,16 @@ struct AccountSetupView: View {
             services = initialProvider.map { [$0] } ?? Set(QuotaProvider.allCases)
             candidates = store.imported
             checked = Set(store.imported.map(\.selectionKey))
+            if initialProvider != nil {
+                step = 2
+                scan()
+            }
+        }
+        .sheet(item: $addingProvider) { provider in
+            AddAccountView(provider: provider, store: store) { prompt in
+                message = prompt
+                addingProvider = nil
+            }
         }
         .confirmationDialog("暂不导入账号？", isPresented: $showingEmptyConfirmation) {
             Button("打开空总览") { finish([]) }
@@ -83,8 +95,8 @@ struct AccountSetupView: View {
             HStack {
                 Text("只有勾选的账号会加入看板。").foregroundStyle(.secondary)
                 Spacer()
-                if scanning != nil { ProgressView().controlSize(.small) }
-                Button("重新扫描") { scan("local") }.disabled(scanning != nil)
+                if scanning { ProgressView().controlSize(.small) }
+                Button("重新扫描") { scan() }.disabled(scanning)
             }
             if let message {
                 Text(message).foregroundStyle(.secondary).font(.callout)
@@ -98,19 +110,31 @@ struct AccountSetupView: View {
                                 BrandMark(provider: provider, size: 15)
                                 Text(provider.rawValue).fontWeight(.semibold)
                                 Spacer()
-                                if provider == .gemini {
-                                    Button("查找 Gemini 账号") { scan("gemini") }.disabled(scanning != nil)
-                                }
+                                Button { addingProvider = provider } label: {
+                                    Label("添加账号", systemImage: "plus")
+                                }.controlSize(.small).disabled(scanning)
                             }
                             if rows.isEmpty {
-                                Text(provider.loginInstructions).font(.callout).foregroundStyle(.secondary)
-                                Link("打开 \(provider.rawValue)", destination: provider.website).font(.callout)
+                                Text("还没有找到本机登录。点「添加账号」开始登录。")
+                                    .font(.callout).foregroundStyle(.secondary)
                             }
                             ForEach(rows, id: \.selectionKey) { account in
-                                Toggle(account.email.isEmpty ? account.label : account.email, isOn: Binding(
-                                    get: { checked.contains(account.selectionKey) },
-                                    set: { if $0 { checked.insert(account.selectionKey) } else { checked.remove(account.selectionKey) } }
-                                )).toggleStyle(.checkbox)
+                                VStack(alignment: .leading, spacing: 5) {
+                                    Toggle(account.email.isEmpty ? account.label : account.email, isOn: Binding(
+                                        get: { checked.contains(account.selectionKey) },
+                                        set: { if $0 { checked.insert(account.selectionKey) } else { checked.remove(account.selectionKey) } }
+                                    )).toggleStyle(.checkbox)
+                                    if checked.contains(account.selectionKey),
+                                       !validEmail(account.email) || enteredEmails[account.selectionKey] != nil {
+                                        TextField("填写此账号的登录邮箱", text: Binding(
+                                            get: { enteredEmails[account.selectionKey] ?? account.email },
+                                            set: { enteredEmails[account.selectionKey] = $0 }
+                                        ))
+                                        .textFieldStyle(.roundedBorder).frame(maxWidth: 270).padding(.leading, 21)
+                                        Text("服务未提供邮箱，请填写你登录时使用的地址。")
+                                            .font(.caption).foregroundStyle(.secondary).padding(.leading, 21)
+                                    }
+                                }
                             }
                         }
                         Divider()
@@ -141,11 +165,27 @@ struct AccountSetupView: View {
         }
     }
 
+    private func validEmail(_ value: String) -> Bool {
+        value.range(of: #"^[^\s@]+@[^\s@]+\.[^\s@]+$"#, options: .regularExpression) != nil
+    }
+
+    private var needsEmail: Bool {
+        finalSelection.contains { account in
+            services.contains { $0.rawValue == account.provider } && !validEmail(account.email)
+        }
+    }
+
     private var finalSelection: [ImportAccount] {
         candidates.filter { account in
             guard let provider = QuotaProvider(rawValue: account.provider) else { return false }
             if services.contains(provider) { return checked.contains(account.selectionKey) }
             return !firstRun && store.imported.contains { $0.selectionKey == account.selectionKey }
+        }.map { account in
+            var account = account
+            if let email = enteredEmails[account.selectionKey] {
+                account.email = email.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            return account
         }
     }
 
@@ -153,7 +193,7 @@ struct AccountSetupView: View {
         switch step {
         case 1:
             step = 2
-            scan("local")
+            scan()
         case 2:
             step = 3
         default:
@@ -161,34 +201,64 @@ struct AccountSetupView: View {
         }
     }
 
-    private func scan(_ source: String) {
-        guard scanning == nil else { return }
-        scanning = source
+    private func scan() {
+        guard !scanning else { return }
+        scanning = true
         message = nil
-        store.discover(source) { found, error in
-            if error == nil {
-                let provider = source == "gemini" ? "Gemini" : nil
-                let retained = candidates.filter {
-                    (provider == nil ? $0.provider == "Gemini" : $0.provider != provider)
-                }
+        store.discover(selectedServices) { found, error in
+            if let error {
+                message = error
+            } else {
+                let scanned = Set(selectedServices.map(\.rawValue))
+                let retained = candidates.filter { !scanned.contains($0.provider) }
                 let old = store.imported.filter { imported in
                     !found.contains { $0.selectionKey == imported.selectionKey || $0.id == imported.id } &&
                     !retained.contains { $0.selectionKey == imported.selectionKey }
                 }
                 candidates = (found + retained + old).map { account in
-                    guard account.email.isEmpty,
-                          let saved = store.cards.first(where: { $0.identityKey == account.identityKey }),
-                          !saved.email.isEmpty else { return account }
-                    return ImportAccount(id: account.id, provider: account.provider, label: account.label,
-                                         email: saved.email, identityKey: account.identityKey,
-                                         geminiRoute: account.geminiRoute)
+                    var account = account
+                    if account.email.isEmpty,
+                       let saved = store.cards.first(where: { $0.identityKey == account.identityKey && $0.provider == account.provider }) {
+                        account.email = saved.email
+                    }
+                    return account
                 }
-                if found.isEmpty && source == "gemini" { message = "没有找到可导入的 Gemini 账号。" }
-            } else {
-                message = error
             }
-            scanning = nil
+            scanning = false
         }
+    }
+}
+
+private struct AddAccountView: View {
+    let provider: QuotaProvider
+    let store: BoardStore
+    let finish: (String) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var error: String?
+    @State private var opening = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Label("添加 \(provider.displayTitle) 账号", systemImage: "person.badge.plus")
+                .font(.headline)
+            Text(provider.loginInstructions)
+            Text("完成登录后回到额度看板，点击「重新扫描」，再勾选新账号。")
+                .font(.callout).foregroundStyle(.secondary)
+            if let error { Text(error).font(.callout).foregroundStyle(.secondary) }
+            HStack {
+                Link(provider == .cursor ? "下载 Cursor" : "安装说明", destination: provider.installURL)
+                Spacer()
+                Button("取消") { dismiss() }.keyboardShortcut(.cancelAction)
+                Button(provider == .cursor ? "打开 Cursor" : "开始登录") {
+                    opening = true
+                    store.beginLogin(provider) { message in
+                        opening = false
+                        if let message { error = message }
+                        else { finish("完成登录后，点击「重新扫描」查找新账号。") }
+                    }
+                }.buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction).disabled(opening)
+            }
+        }.padding(22).frame(width: 400)
     }
 }
 
@@ -197,7 +267,7 @@ struct BoardSettingsView: View {
     @State var provider: QuotaProvider
     @State private var editing: QuotaCard?
     let addAccounts: (QuotaProvider) -> Void
-    let switchGemini: (QuotaCard) -> Void
+    let switchAccount: (QuotaCard) -> Void
 
     var body: some View {
         HStack(spacing: 0) {
@@ -205,7 +275,10 @@ struct BoardSettingsView: View {
                 Text("平台").font(.subheadline.weight(.medium)).foregroundStyle(.secondary)
                     .padding(.horizontal, 9).padding(.bottom, 6)
                 ForEach(QuotaProvider.allCases, id: \.self) { item in
-                    Button { provider = item } label: {
+                    Button {
+                        provider = item
+                        store.switchMessage = nil
+                    } label: {
                         HStack(spacing: 8) {
                             BrandMark(provider: item, size: 15)
                             Text(item.rawValue)
@@ -227,7 +300,7 @@ struct BoardSettingsView: View {
                 HStack {
                     VStack(alignment: .leading, spacing: 3) {
                         Text("在总览中显示").fontWeight(.medium)
-                        Text("显示所选账号的最短周期额度").font(.subheadline).foregroundStyle(.secondary)
+                        Text("显示当前账号的最短周期额度").font(.subheadline).foregroundStyle(.secondary)
                     }
                     Spacer()
                     Toggle("在总览中显示", isOn: Binding(
@@ -239,10 +312,10 @@ struct BoardSettingsView: View {
                 HStack {
                     Text("登录账号").fontWeight(.semibold)
                     Spacer()
-                    if store.preferredAccounts[provider.rawValue] != nil {
-                        Button("跟随当前登录") { store.followLogin(for: provider.rawValue) }.controlSize(.small)
-                    }
                     Button("添加账号") { addAccounts(provider) }.controlSize(.small)
+                }
+                if let message = store.switchMessage {
+                    Text(message).font(.callout).foregroundStyle(.secondary)
                 }
                 let accounts = store.cards.filter { $0.provider == provider.rawValue }
                 if accounts.isEmpty {
@@ -283,15 +356,14 @@ struct BoardSettingsView: View {
                 }
             }
             Spacer()
-            if account.errorCode == "keychain_required", provider == .cursor || provider == .gemini {
-                Button("授权读取") { store.refresh(account: provider == .gemini ? "gemini" : account.id, interactive: true) }
+            if account.errorCode == "keychain_required" {
+                Button("授权读取") { store.refresh(account: account.id, interactive: true) }
                     .controlSize(.small).disabled(store.refreshing)
             }
-            if !overview {
-                Button("用于总览") { store.selectOverviewAccount(account) }.controlSize(.small)
-            }
-            if provider == .gemini, account.geminiRoute != nil, !signedIn {
-                Button("切换登录") { switchGemini(account) }.controlSize(.small)
+            if !signedIn {
+                Button("切换") { switchAccount(account) }
+                    .controlSize(.small).disabled(store.switchingAccount)
+                    .help(provider == .copilot ? "切换 GitHub CLI 登录" : "切换 \(provider.displayTitle) 登录")
             }
             Button { editing = account } label: { Image(systemName: "pencil").frame(width: 24, height: 24) }
                 .buttonStyle(.plain).help("编辑账号").accessibilityLabel("编辑 \(store.displayName(for: account))")

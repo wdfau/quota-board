@@ -59,15 +59,15 @@ func readRows(_ path: URL, query: String) throws -> [[String: Any]] {
     return rows
 }
 
-func password(service: String, account: String) throws -> Data {
-    let query: [String: Any] = [
+func password(service: String, account: String? = nil) throws -> Data {
+    var query: [String: Any] = [
         kSecClass as String: kSecClassGenericPassword,
         kSecAttrService as String: service,
-        kSecAttrAccount as String: account,
         kSecReturnData as String: true,
         kSecMatchLimit as String: kSecMatchLimitOne,
         kSecUseAuthenticationUI as String: interactive ? kSecUseAuthenticationUIAllow : kSecUseAuthenticationUIFail
     ]
+    if let account { query[kSecAttrAccount as String] = account }
     var result: CFTypeRef?
     let status = SecItemCopyMatching(query as CFDictionary, &result)
     guard status == errSecSuccess, let data = result as? Data else {
@@ -76,7 +76,7 @@ func password(service: String, account: String) throws -> Data {
     return data
 }
 
-func decrypt(_ encrypted: Data, password: Data, host: String? = nil) throws -> String {
+func decrypt(_ encrypted: Data, password: Data) throws -> String {
     guard encrypted.starts(with: Data("v10".utf8)), encrypted.count > 3 else {
         throw AccessError(code: "storage_changed", message: "暂不支持此版本的登录加密格式")
     }
@@ -112,19 +112,17 @@ func decrypt(_ encrypted: Data, password: Data, host: String? = nil) throws -> S
     guard result == kCCSuccess else {
         throw AccessError(code: "decrypt_failed", message: "登录加密信息不匹配，请重新登录对应应用")
     }
-    var data = Data(plaintext.prefix(outputCount))
-    if let host = host {
-        let digest = Data(SHA256.hash(data: Data(host.utf8)))
-        if data.starts(with: digest) { data.removeFirst(digest.count) }
-    }
+    let data = Data(plaintext.prefix(outputCount))
     guard let text = String(data: data, encoding: .utf8), !text.contains("\0") else {
         throw AccessError(code: "decrypt_failed", message: "登录记录无法解码")
     }
     return text
 }
 
-func cursorSession() throws -> [String: Any] {
-    let path = userHome.appendingPathComponent("Library/Application Support/Cursor/User/globalStorage/state.vscdb")
+func cursorSession(profile: String?) throws -> [String: Any] {
+    let root = profile.map { URL(fileURLWithPath: $0) }
+        ?? userHome.appendingPathComponent("Library/Application Support/Cursor")
+    let path = root.appendingPathComponent("User/globalStorage/state.vscdb")
     let rows = try readRows(path, query: "SELECT key, value FROM ItemTable WHERE key IN ('cursorAuth/accessToken','cursorAuth/cachedEmail','cursorAuth/stripeMembershipType')")
     var values: [String: String] = [:]
     for row in rows {
@@ -167,57 +165,36 @@ func cursorSession() throws -> [String: Any] {
     ]
 }
 
-func geminiSession() throws -> [String: Any] {
-    let browsers = [
-        ("Chrome", "Google/Chrome", "Chrome Safe Storage", "Chrome"),
-        ("Edge", "Microsoft Edge", "Microsoft Edge Safe Storage", "Microsoft Edge"),
-        ("Brave", "BraveSoftware/Brave-Browser", "Brave Safe Storage", "Brave")
-    ]
-    var denied: AccessError?
-    for (name, folder, service, account) in browsers {
-        let root = userHome.appendingPathComponent("Library/Application Support/" + folder)
-        let candidates = (try? FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)) ?? []
-        let profiles = candidates.filter { $0.lastPathComponent == "Default" || $0.lastPathComponent.hasPrefix("Profile ") }
-            .sorted { $0.lastPathComponent < $1.lastPathComponent }
-        for profile in profiles {
-            let stores = [profile.appendingPathComponent("Cookies"), profile.appendingPathComponent("Network/Cookies")]
-            guard let store = stores.first(where: { FileManager.default.fileExists(atPath: $0.path) }) else { continue }
-            let rows = (try? readRows(store, query: """
-                SELECT host_key, name, value, encrypted_value, expires_utc
-                FROM cookies
-                WHERE host_key IN ('.google.com','google.com','.gemini.google.com','gemini.google.com')
-                ORDER BY length(host_key)
-                """)) ?? []
-            guard rows.contains(where: { ["SID", "__Secure-1PSID", "__Secure-3PSID"].contains($0["name"] as? String ?? "") }) else { continue }
-            let key: Data
-            do { key = try password(service: service, account: account) }
-            catch let error as AccessError { denied = error; break }
-            var cookies: [String: String] = [:]
-            let now = (Date().timeIntervalSince1970 + 11644473600) * 1_000_000
-            for row in rows {
-                guard let cookieName = row["name"] as? String, let host = row["host_key"] as? String else { continue }
-                if let expiry = row["expires_utc"] as? Int64, expiry > 0, Double(expiry) <= now { continue }
-                var value = row["value"] as? String ?? ""
-                if value.isEmpty, let encrypted = row["encrypted_value"] as? Data, !encrypted.isEmpty {
-                    value = (try? decrypt(encrypted, password: key, host: host)) ?? ""
-                }
-                if !value.isEmpty, !value.contains(";"), !value.contains("\n") { cookies[cookieName] = value }
-            }
-            if cookies["__Secure-1PSID"] != nil || cookies["SID"] != nil {
-                return ["cookie": cookies.sorted(by: { $0.key < $1.key }).map { "\($0.key)=\($0.value)" }.joined(separator: "; "),
-                        "profile": "\(name) / \(profile.lastPathComponent)"]
-            }
-        }
+
+func claudeSession(profile: String?) throws -> [String: Any] {
+    let root = profile.map { URL(fileURLWithPath: $0) } ?? userHome.appendingPathComponent(".claude")
+    let service = "Claude Code-credentials" + (profile.map {
+        "-" + SHA256.hash(data: Data($0.utf8)).prefix(4).map { String(format: "%02x", $0) }.joined()
+    } ?? "")
+    func session(from data: Data) -> [String: Any]? {
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let credentials = object["claudeAiOauth"] as? [String: Any],
+              let token = credentials["accessToken"] as? String, !token.isEmpty else { return nil }
+        if let expires = credentials["expiresAt"] as? Double,
+           expires <= Date().timeIntervalSince1970 * 1000 { return nil }
+        return ["token": token, "scopes": credentials["scopes"] as? [String] ?? []]
     }
-    if let denied = denied { throw denied }
-    throw AccessError(code: "not_logged_in", message: "请先在 Chrome、Edge 或 Brave 登录 gemini.google.com")
+    if let file = try? Data(contentsOf: root.appendingPathComponent(".credentials.json")),
+       let parsed = session(from: file) { return parsed }
+    let data = try password(service: service)
+    guard let parsed = session(from: data) else {
+        throw AccessError(code: "not_logged_in", message: "请在 Claude Code 重新登录此账号。")
+    }
+    return parsed
 }
 
 do {
     let result: [String: Any]
-    switch CommandLine.arguments.dropFirst().first {
-    case "cursor": result = try cursorSession()
-    case "gemini": result = try geminiSession()
+    let arguments = CommandLine.arguments.dropFirst().filter { $0 != "--interactive" }
+    let profile = arguments.dropFirst().first
+    switch arguments.first {
+    case "cursor": result = try cursorSession(profile: profile)
+    case "claude": result = try claudeSession(profile: profile)
     default: throw AccessError(code: "invalid_provider", message: "未指定服务")
     }
     let data = try JSONSerialization.data(withJSONObject: result)

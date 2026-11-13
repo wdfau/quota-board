@@ -27,12 +27,6 @@ struct QuotaWindow: Codable, Identifiable {
     }
 }
 
-struct GeminiRoute: Codable {
-    let browser: String
-    let profile: String
-    let slot: Int
-}
-
 struct QuotaCard: Codable, Identifiable {
     let id: String
     let provider: String
@@ -48,7 +42,6 @@ struct QuotaCard: Codable, Identifiable {
     let url: String
     var errorCode: String?
     var identityKey: String?
-    var geminiRoute: GeminiRoute?
 
     var emailPrefix: String? {
         let address = email.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -62,7 +55,8 @@ struct QuotaCard: Codable, Identifiable {
             "Codex": "https://chatgpt.com/codex/settings/usage",
             "Kiro": "https://app.kiro.dev/account/usage",
             "Cursor": "https://cursor.com/dashboard",
-            "Gemini": "https://gemini.google.com/usage"
+            "Claude": "https://claude.ai/settings/usage",
+            "GitHub Copilot": "https://github.com/settings/copilot"
         ]
         return QuotaCard(id: id, provider: provider, label: label, email: "",
                          plan: provider, status: "pending", windows: [], details: [],
@@ -74,9 +68,8 @@ struct ImportAccount: Codable, Identifiable {
     let id: String
     let provider: String
     let label: String
-    let email: String
+    var email: String
     let identityKey: String
-    var geminiRoute: GeminiRoute?
 
     var selectionKey: String { provider + ":" + identityKey }
 
@@ -84,7 +77,6 @@ struct ImportAccount: Codable, Identifiable {
         var card = QuotaCard.initial(id, provider, label)
         card.email = email
         card.identityKey = identityKey
-        card.geminiRoute = geminiRoute
         return card
     }
 }
@@ -94,14 +86,20 @@ private struct DiscoveryResult: Decodable {
     var message: String?
 }
 
+private struct SwitchResult: Decodable {
+    var switched: Bool?
+    var launch: Bool?
+    var previousID: String?
+    var previousIdentity: String?
+    var message: String?
+}
+
 final class BoardStore: ObservableObject {
     private static let importedKey = "ImportedQuotaAccounts"
     @Published var cards: [QuotaCard] = []
     @Published private(set) var imported: [ImportAccount] = []
     @Published private(set) var hiddenProviders: Set<String> =
         Set(UserDefaults.standard.stringArray(forKey: "HiddenQuotaProviders") ?? [])
-    @Published private(set) var preferredAccounts: [String: String] =
-        UserDefaults.standard.dictionary(forKey: "OverviewQuotaAccounts") as? [String: String] ?? [:]
     private(set) var isConfigured = false
     private var refreshAfterChange = false
     @Published private(set) var activeAccounts: [String: String] = [:]
@@ -111,7 +109,8 @@ final class BoardStore: ObservableObject {
     @Published var processMessage: String?
     @Published private(set) var aliases = UserDefaults.standard.dictionary(forKey: "AccountAliases") as? [String: String] ?? [:]
     @Published var renamingAccount: QuotaCard?
-    @Published private(set) var openingGemini = false
+    @Published private(set) var switchingAccount = false
+    @Published var switchMessage: String?
     private var process: Process?
     private var timer: Timer?
     private var activeLookupGeneration = 0
@@ -125,8 +124,8 @@ final class BoardStore: ObservableObject {
         if let data = UserDefaults.standard.data(forKey: Self.importedKey),
            let accounts = try? JSONDecoder().decode([ImportAccount].self, from: data) {
             isConfigured = true
-            imported = accounts
-            cards = accounts.map(\.placeholder)
+            imported = accounts.filter { QuotaProvider(rawValue: $0.provider) != nil }
+            cards = imported.map(\.placeholder)
         }
         if let bytes = try? Data(contentsOf: cacheURL),
            let stored = try? JSONDecoder().decode([QuotaCard].self, from: bytes) {
@@ -152,7 +151,10 @@ final class BoardStore: ObservableObject {
         imported = accounts
         UserDefaults.standard.set(data, forKey: Self.importedKey)
         cards = accounts.map { account in
-            oldCards.first { $0.id == account.id && $0.identityKey == account.identityKey } ?? account.placeholder
+            guard var previous = oldCards.first(where: { $0.id == account.id && $0.identityKey == account.identityKey })
+            else { return account.placeholder }
+            if !account.email.isEmpty { previous.email = account.email }
+            return previous
         }
         persist()
         if refreshing { refreshAfterChange = true }
@@ -164,30 +166,17 @@ final class BoardStore: ObservableObject {
         UserDefaults.standard.set(hiddenProviders.sorted(), forKey: "HiddenQuotaProviders")
     }
 
-    func followLogin(for provider: String) {
-        preferredAccounts.removeValue(forKey: provider)
-        UserDefaults.standard.set(preferredAccounts, forKey: "OverviewQuotaAccounts")
-    }
-
-    func selectOverviewAccount(_ card: QuotaCard) {
-        guard let identity = card.identityKey else { return }
-        preferredAccounts[card.provider] = identity
-        UserDefaults.standard.set(preferredAccounts, forKey: "OverviewQuotaAccounts")
-    }
-
     func overviewCard(for provider: String) -> QuotaCard? {
         let candidates = cards.filter { $0.provider == provider }
-        if let preferred = preferredAccounts[provider],
-           let card = candidates.first(where: { $0.identityKey == preferred }) { return card }
         return candidates.first { $0.id == activeAccounts[provider] } ?? candidates.first
     }
 
-    func discover(_ source: String, completion: @escaping ([ImportAccount], String?) -> Void) {
+    func discover(_ providers: [QuotaProvider], completion: @escaping ([ImportAccount], String?) -> Void) {
         let script = resources.appendingPathComponent("worker.py").path
         DispatchQueue.global(qos: .userInitiated).async {
             let task = Process()
             task.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
-            task.arguments = [script, "--discover", source]
+            task.arguments = [script, "--discover"] + providers.map(\.rawValue)
             let pipe = Pipe()
             task.standardOutput = pipe
             task.standardError = FileHandle.nullDevice
@@ -214,7 +203,7 @@ final class BoardStore: ObservableObject {
     var readyCount: Int { cards.filter { $0.status == "ok" }.count }
 
     func displayName(for card: QuotaCard) -> String {
-        aliases[aliasKey(card)] ?? card.emailPrefix ?? (card.provider == "Gemini" ? card.plan : card.label)
+        aliases[aliasKey(card)] ?? card.emailPrefix ?? card.label
     }
 
     func saveName(_ name: String, for card: QuotaCard) {
@@ -227,58 +216,192 @@ final class BoardStore: ObservableObject {
         card.id + (card.identityKey.map { ":" + $0 } ?? "")
     }
 
-    func recordGeminiSelection(_ card: QuotaCard) {
-        let marker = cacheURL.deletingLastPathComponent().appendingPathComponent("active-gemini-account")
-        do {
-            try Data((card.id + "\n").utf8).write(to: marker, options: .atomic)
-            activeAccounts["Gemini"] = card.id
-            updateActiveAccounts()
-        } catch {
-            processMessage = "未能保存当前 Gemini 账号"
+    @MainActor func beginLogin(_ provider: QuotaProvider, completion: @escaping (String?) -> Void) {
+        if provider == .cursor {
+            let profile = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+            launchCursor(accountID: "cursor-profile-" + profile, completion: completion)
+            return
         }
-    }
-
-    func openGemini(_ card: QuotaCard, page: String = "app") {
-        guard let route = card.geminiRoute, !openingGemini else { return }
-        openingGemini = true
-        processMessage = nil
-        let worker = resources.appendingPathComponent("worker.py").path
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+        let arguments = ["--login", provider.rawValue, UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()]
+        let script = resources.appendingPathComponent("worker.py").path
+        DispatchQueue.global(qos: .userInitiated).async {
             let task = Process()
             task.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
-            task.arguments = [worker, "--gemini-open", card.id, "--slot", String(route.slot), "--page", page]
+            task.arguments = [script] + arguments + ["--check"]
             let pipe = Pipe()
             task.standardOutput = pipe
             task.standardError = FileHandle.nullDevice
-            var response: [String: Any]?
+            var message: String?
             if (try? task.run()) != nil {
                 let data = pipe.fileHandleForReading.readDataToEndOfFile()
                 task.waitUntilExit()
-                response = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+                if task.terminationStatus != 0 {
+                    let output = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+                    message = output.isEmpty ? "无法启动登录组件。" : output
+                }
+            } else {
+                message = "无法检查登录组件。"
             }
-            let opened = response?["opened"] as? Bool ?? false
-            let message = response?["message"] as? String ?? "暂时无法打开 Gemini，请稍后重试"
+            let error = message
             DispatchQueue.main.async {
-                guard let self else { return }
-                self.openingGemini = false
-                if opened {
-                    self.activeAccounts["Gemini"] = card.id
-                    self.updateActiveAccounts()
-                } else {
-                    self.processMessage = message
+                if let error, !error.isEmpty { completion(error) }
+                else {
+                    Self.openTerminal(worker: script, arguments: arguments,
+                                      title: "添加 \(provider.displayTitle) 账号", completion: completion)
                 }
             }
         }
+    }
+
+    @MainActor private func launchCursor(accountID: String, completion: @escaping (String?) -> Void) {
+        guard let app = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.todesktop.230313mzl4w4u92") else {
+            completion("未找到 Cursor。安装后再打开并登录。")
+            return
+        }
+        if accountID == "cursor" {
+            completion(NSWorkspace.shared.open(app) ? nil : "无法打开 Cursor。")
+            return
+        }
+        let directory = cacheURL.deletingLastPathComponent().appendingPathComponent("Profiles/Cursor")
+            .appendingPathComponent(String(accountID.dropFirst("cursor-profile-".count)))
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
+                                                    attributes: [.posixPermissions: 0o700])
+        } catch {
+            completion("无法创建 Cursor 登录配置。")
+            return
+        }
+        let config = NSWorkspace.OpenConfiguration()
+        config.createsNewApplicationInstance = true
+        config.arguments = ["--user-data-dir", directory.path]
+        NSWorkspace.shared.openApplication(at: app, configuration: config) { _, error in
+            DispatchQueue.main.async { completion(error == nil ? nil : "无法打开此 Cursor 账号。") }
+        }
+    }
+
+    @MainActor private static func openTerminal(worker: String, arguments: [String], title: String, completion: @escaping (String?) -> Void) {
+        guard let terminal = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Terminal") else {
+            completion("无法找到 macOS 终端。")
+            return
+        }
+        func quote(_ value: String) -> String { "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'" }
+        let command = (["/usr/bin/python3", worker] + arguments)
+            .map(quote).joined(separator: " ")
+        do {
+            let url = FileManager.default.temporaryDirectory.appendingPathComponent("QuotaBoard-\(UUID().uuidString).command")
+            let script = """
+            #!/bin/sh
+            /bin/rm -f -- \(quote(url.path))
+            printf '%s\\n' \(quote(title))
+            \(command)
+            """
+            try Data(script.utf8).write(to: url, options: .atomic)
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: url.path)
+            NSWorkspace.shared.open([url], withApplicationAt: terminal, configuration: NSWorkspace.OpenConfiguration()) { _, error in
+                DispatchQueue.main.async {
+                    if error != nil { try? FileManager.default.removeItem(at: url) }
+                    completion(error == nil ? nil : "无法打开终端，请重试。")
+                }
+            }
+        } catch {
+            completion("无法创建登录窗口，请重试。")
+        }
+    }
+
+    @MainActor func switchLogin(_ card: QuotaCard) async {
+        guard let provider = QuotaProvider(rawValue: card.provider), let identity = card.identityKey,
+              !switchingAccount else { return }
+        switchingAccount = true
+        switchMessage = nil
+        defer { switchingAccount = false }
+
+        let codexApp = provider == .codex
+            ? NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.openai.codex") : nil
+        if provider == .codex {
+            let running = NSRunningApplication.runningApplications(withBundleIdentifier: "com.openai.codex")
+            guard running.allSatisfy({ $0.terminate() }) else {
+                switchMessage = "请退出 Codex 后再切换。"
+                return
+            }
+            for _ in 0..<32 where running.contains(where: { !$0.isTerminated }) {
+                try? await Task.sleep(for: .milliseconds(250))
+            }
+            guard running.allSatisfy(\.isTerminated) else {
+                switchMessage = "请退出 Codex 后再切换。"
+                return
+            }
+        }
+
+        let script = resources.appendingPathComponent("worker.py").path
+        let result = await Task.detached(priority: .userInitiated) {
+            let task = Process()
+            task.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+            task.arguments = [script, "--switch", card.id, identity]
+            let pipe = Pipe()
+            task.standardOutput = pipe
+            task.standardError = FileHandle.nullDevice
+            guard (try? task.run()) != nil else { return nil as SwitchResult? }
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            task.waitUntilExit()
+            return try? JSONDecoder().decode(SwitchResult.self, from: data)
+        }.value
+        if let codexApp { NSWorkspace.shared.open(codexApp) }
+        guard let result, result.switched == true else {
+            switchMessage = result?.message ?? "切换未完成，请重试。"
+            return
+        }
+
+        if let previousID = result.previousID, let previousIdentity = result.previousIdentity,
+           let index = imported.firstIndex(where: { $0.id == "codex-default" && $0.identityKey == previousIdentity }) {
+            let old = imported[index]
+            var updated = imported
+            if updated.contains(where: { $0.id == previousID && $0.identityKey == previousIdentity }) {
+                updated.remove(at: index)
+            } else {
+                updated[index] = ImportAccount(id: previousID, provider: old.provider, label: old.label,
+                                               email: old.email, identityKey: old.identityKey)
+            }
+            if let name = aliases["codex-default:" + previousIdentity] {
+                aliases[previousID + ":" + previousIdentity] = name
+                UserDefaults.standard.set(aliases, forKey: "AccountAliases")
+            }
+            saveImports(updated)
+        }
+        if provider == .cursor {
+            let error = await withCheckedContinuation { continuation in
+                launchCursor(accountID: card.id) { continuation.resume(returning: $0) }
+            }
+            if let error {
+                switchMessage = error
+                return
+            }
+        }
+        if result.launch == true {
+            let error = await withCheckedContinuation { continuation in
+                Self.openTerminal(worker: script, arguments: ["--launch", card.id], title: "打开 \(provider.displayTitle)") {
+                    continuation.resume(returning: $0)
+                }
+            }
+            if let error {
+                switchMessage = error
+                return
+            }
+        }
+        activeAccounts[card.provider] = card.id
+        if refreshing { refreshAfterChange = true } else { refresh() }
+        switchMessage = "已切换到 \(displayName(for: card))"
+        updateActiveAccounts()
     }
 
     func updateActiveAccounts() {
         activeLookupGeneration += 1
         let generation = activeLookupGeneration
         let worker = resources.appendingPathComponent("worker.py").path
+        let providers = Set(imported.map(\.provider)).sorted()
         DispatchQueue.global(qos: .utility).async { [weak self] in
             let probe = Process()
             probe.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
-            probe.arguments = [worker, "--active"]
+            probe.arguments = [worker, "--active"] + providers
             let output = Pipe()
             probe.standardOutput = output
             probe.standardError = FileHandle.nullDevice
@@ -296,13 +419,13 @@ final class BoardStore: ObservableObject {
 
     func refresh(account: String? = nil, interactive: Bool = false) {
         let requested = imported.filter { selection in
-            account == nil || selection.id == account || (account == "gemini" && selection.provider == "Gemini")
+            account == nil || selection.id == account
         }
         guard !refreshing, !requested.isEmpty else { return }
         let selected = Dictionary(requested.map { ($0.id, $0.identityKey) }, uniquingKeysWith: { _, newest in newest })
         guard let selectedJSON = try? JSONEncoder().encode(selected) else { return }
         refreshing = true
-        refreshingIDs = Set(requested.map { $0.provider == "Gemini" ? "gemini" : $0.id })
+        refreshingIDs = Set(requested.map(\.id))
         processMessage = nil
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
@@ -344,13 +467,6 @@ final class BoardStore: ObservableObject {
                             }) == true else { return }
                             self?.accept(card)
                         }
-                    }
-                    if let raw = object["geminiCards"],
-                       let bytes = try? JSONSerialization.data(withJSONObject: raw),
-                       let cards = try? JSONDecoder().decode([QuotaCard].self, from: bytes) {
-                        DispatchQueue.main.async { self?.acceptGemini(cards) }
-                    } else if let error = object["geminiError"] as? [String: String] {
-                        DispatchQueue.main.async { self?.acceptGeminiError(error) }
                     }
                 }
             }
@@ -398,35 +514,6 @@ final class BoardStore: ObservableObject {
         refreshingIDs.remove(card.id)
     }
 
-    private func acceptGemini(_ accounts: [QuotaCard]) {
-        let byID = Dictionary(accounts.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
-        let selected = imported.filter { $0.provider == "Gemini" }
-        cards = cards.filter { $0.provider != "Gemini" } + selected.map { account in
-            if let card = byID[account.id] { return card }
-            var card = account.placeholder
-            card.status = "error"
-            card.message = "浏览器中未找到此账号，请登录后重新扫描。"
-            card.errorCode = "not_logged_in"
-            return card
-        }
-        refreshingIDs.remove("gemini")
-    }
-
-    private func acceptGeminiError(_ error: [String: String]) {
-        let code = error["code"] ?? "read_failed"
-        let message = error["message"] ?? "Gemini 账号读取失败"
-        let retryable = ["network", "rate_limited", "format_changed", "read_failed"].contains(code)
-        let known = cards.filter { $0.provider == "Gemini" && $0.geminiRoute != nil }
-        let accounts = retryable && !known.isEmpty ? known : imported.filter { $0.provider == "Gemini" }.map(\.placeholder)
-        acceptGemini(accounts.map { account in
-            var card = account
-            card.status = card.windows.isEmpty ? "error" : "stale"
-            card.errorCode = code
-            card.message = message
-            return card
-        })
-    }
-
     private func persist() {
         guard let data = try? JSONEncoder().encode(cards) else { return }
         do {
@@ -461,17 +548,29 @@ func refreshDescription(_ value: String?, now: Date) -> String {
     return "\(minutes)分钟后重置"
 }
 
-enum QuotaProvider: String, CaseIterable {
-    case codex = "Codex", kiro = "Kiro", cursor = "Cursor", gemini = "Gemini"
+enum QuotaProvider: String, CaseIterable, Identifiable {
+    case codex = "Codex", kiro = "Kiro", cursor = "Cursor", claude = "Claude", copilot = "GitHub Copilot"
 
-    var asset: String { self == .codex ? "openai" : rawValue.lowercased() }
-    var hasMultipleAccounts: Bool { self == .codex || self == .kiro || self == .gemini }
+    var id: String { rawValue }
+    var asset: String { self == .codex ? "openai" : self == .copilot ? "githubcopilot" : rawValue.lowercased() }
+    var displayTitle: String { self == .copilot ? "Copilot" : rawValue }
+    var installURL: URL {
+        switch self {
+        case .codex: return URL(string: "https://developers.openai.com/codex/cli/")!
+        case .kiro: return URL(string: "https://kiro.dev/docs/cli/installation/")!
+        case .cursor: return URL(string: "https://cursor.com/download")!
+        case .claude: return URL(string: "https://code.claude.com/docs/en/setup")!
+        case .copilot: return URL(string: "https://cli.github.com/")!
+        }
+    }
+
     var website: URL {
         switch self {
         case .codex: return URL(string: "https://openai.com/codex/")!
         case .kiro: return URL(string: "https://kiro.dev/")!
         case .cursor: return URL(string: "https://cursor.com/")!
-        case .gemini: return URL(string: "https://gemini.google.com/")!
+        case .claude: return URL(string: "https://claude.ai/")!
+        case .copilot: return URL(string: "https://github.com/features/copilot")!
         }
     }
     var accessibilityName: String { self == .codex ? "OpenAI Codex" : rawValue }
@@ -480,7 +579,8 @@ enum QuotaProvider: String, CaseIterable {
         case .codex: return "terminal"
         case .kiro: return "bolt"
         case .cursor: return "cursorarrow"
-        case .gemini: return "sparkle"
+        case .claude: return "asterisk"
+        case .copilot: return "chevron.left.forwardslash.chevron.right"
         }
     }
 
@@ -489,16 +589,18 @@ enum QuotaProvider: String, CaseIterable {
         case .codex: return scheme == .dark ? .mint : Color(red: 0.06, green: 0.49, blue: 0.37)
         case .kiro: return scheme == .dark ? Color(red: 0.72, green: 0.60, blue: 1) : Color(red: 0.47, green: 0.30, blue: 0.80)
         case .cursor: return .primary
-        case .gemini: return scheme == .dark ? Color(red: 0.43, green: 0.68, blue: 1) : .blue
+        case .claude: return Color(red: 0.83, green: 0.37, blue: 0.23)
+        case .copilot: return scheme == .dark ? .cyan : .blue
         }
     }
 
     var loginInstructions: String {
         switch self {
-        case .codex: return "在 Codex 登录后，回到这里重新扫描。"
-        case .kiro: return "在 Kiro CLI 登录后，回到这里重新扫描。"
-        case .cursor: return "在 Cursor 桌面应用登录后，回到这里重新扫描。"
-        case .gemini: return "先在 Chrome、Edge 或 Brave 登录 Gemini，再点「查找 Gemini 账号」。"
+        case .codex: return "通过 Codex CLI 登录 ChatGPT 账号。"
+        case .kiro: return "通过 Kiro CLI 登录账号。"
+        case .cursor: return "在单独的 Cursor 窗口登录新账号，原有账号可以继续使用。"
+        case .claude: return "通过 Claude Code 登录 Claude 订阅账号。"
+        case .copilot: return "使用 GitHub CLI 授权有 Copilot 权限的 GitHub 账号。"
         }
     }
 
@@ -529,7 +631,7 @@ struct BrandMark: View {
                 Image(systemName: provider.fallbackSymbol).font(.system(size: size - 2, weight: .medium))
             }
         }.frame(width: size, height: size)
-            .foregroundStyle(provider == .gemini ? Color.blue : Color.primary)
+            .foregroundStyle(.primary)
             .accessibilityHidden(true)
     }
 }
@@ -600,7 +702,7 @@ private struct ProviderRings: View {
             VStack(spacing: 5) {
                 HStack(spacing: 4) {
                     BrandMark(provider: provider, size: 15)
-                    Text(provider.rawValue).font(.system(size: 11, weight: .semibold))
+                    Text(provider.displayTitle).font(.system(size: 11, weight: .semibold))
                 }
                 Text(accountName ?? "待导入").font(.system(size: 11)).foregroundStyle(.secondary)
                     .lineLimit(1).truncationMode(.middle)
@@ -638,32 +740,25 @@ private struct AccountRings: View {
     let title: String
     let isActive: Bool
     let now: Date
-    let open: (() -> Void)?
     @Environment(\.colorScheme) private var scheme
 
     private var accountTitle: some View {
         HStack(spacing: 5) {
-            if isActive && provider.hasMultipleAccounts {
+            if isActive {
                 Circle().fill(provider.tint(for: scheme)).frame(width: 4, height: 4)
                     .help("总览账号").accessibilityLabel("总览账号")
             }
             Text(title).font(.system(size: 11, weight: .semibold))
                 .lineLimit(1).truncationMode(.middle)
-            if open != nil {
-                Image(systemName: "arrow.up.right").font(.system(size: 8))
-                    .foregroundStyle(.secondary)
-            }
         }.frame(height: 17)
     }
 
     var body: some View {
         VStack(spacing: 8) {
-            if let open {
-                Button(action: open) { accountTitle.contentShape(Rectangle()) }
-                    .buttonStyle(.plain).help("在 Mac 版 Gemini 切换到 \(title)")
-                    .accessibilityLabel("在 Mac 版 Gemini 切换到 \(title)")
-            } else {
-                accountTitle.help(title)
+            accountTitle.help(title)
+            if !card.email.isEmpty && card.email != title {
+                Text(card.email).font(.system(size: 11)).foregroundStyle(.secondary)
+                    .lineLimit(1).truncationMode(.middle).help(card.email)
             }
 
             if isActive {
@@ -749,7 +844,6 @@ struct RenameAccountView: View {
 private struct MenuBoardView: View {
     @ObservedObject var store: BoardStore
     let provider: QuotaProvider?
-    let switchGemini: (QuotaCard) -> Void
     let showSettings: (QuotaProvider?) -> Void
     let navigate: (QuotaProvider?) -> Void
 
@@ -852,8 +946,7 @@ private struct MenuBoardView: View {
                                         Rectangle().fill(.primary.opacity(0.10)).frame(width: 1, height: 112)
                                     }
                                     AccountRings(provider: provider, card: card, title: store.displayName(for: card),
-                                                 isActive: card.id == activeID, now: context.date,
-                                                 open: card.geminiRoute == nil ? nil : { switchGemini(card) })
+                                                 isActive: card.id == activeID, now: context.date)
                                         .padding(.vertical, 6)
                                         .background(card.id == activeID ? provider.tint(for: .light).opacity(0.08) : .clear,
                                                     in: RoundedRectangle(cornerRadius: 12))
@@ -872,8 +965,7 @@ private struct MenuBoardView: View {
             if let lastUpdate {
                 Text(lastUpdate, style: .time).monospacedDigit()
             }
-            if store.openingGemini { Text("正在核对账号…") }
-            else if let message = store.processMessage { Text(message).lineLimit(1) }
+            if let message = store.processMessage { Text(message).lineLimit(1) }
             else if !allReady && !store.refreshing { Text("待更新") }
             Spacer()
             if provider == nil {
@@ -899,9 +991,8 @@ private struct MenuBoardView: View {
 
     private func refresh() {
         store.updateActiveAccounts()
-        if let provider, provider == .cursor || provider == .gemini,
-           cards(for: provider).contains(where: { $0.errorCode == "keychain_required" }) {
-            store.refresh(account: provider == .gemini ? "gemini" : "cursor", interactive: true)
+        if let provider, let card = cards(for: provider).first(where: { $0.errorCode == "keychain_required" }) {
+            store.refresh(account: card.id, interactive: true)
         } else {
             store.refresh()
         }
@@ -948,36 +1039,12 @@ private final class QuotaPanel: NSPanel {
     }
 }
 
-private final class FrostedBackdrop: NSVisualEffectView {
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
-        material = .popover
-        blendingMode = .behindWindow
-        state = .active
-
-        // The backdrop is created at its final size, along with the window and content.
-        maskImage = NSImage(size: frameRect.size, flipped: false) { rect in
-            guard let context = NSGraphicsContext.current?.cgContext else { return false }
-            let shape = RoundedRectangle(cornerRadius: 23, style: .continuous)
-            context.setFillColor(NSColor.black.cgColor)
-            context.addPath(shape.path(in: rect).cgPath)
-            context.fillPath()
-            return true
-        }
-    }
-
-    required init?(coder: NSCoder) { nil }
-}
-
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var statusItem: NSStatusItem!
     private var panel: QuotaPanel?
     private var setupWindow: NSWindow?
     private var settingsWindow: NSWindow?
     private var store: BoardStore!
-    private var switchingGemini = false
-    private var geminiVerification: Task<Void, Never>?
-    private var openingGeminiFromShortcut = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         store = BoardStore()
@@ -997,16 +1064,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         statusItem.length = NSStatusItem.squareLength
         statusItem.button?.image = image
         statusItem.button?.setAccessibilityLabel("额度看板")
-        statusItem.button?.toolTip = "额度看板 · Codex、Kiro、Cursor、Gemini"
+        statusItem.button?.toolTip = "额度看板"
         statusItem.button?.target = self
         statusItem.button?.action = #selector(statusClicked)
         statusItem.button?.sendAction(on: [.leftMouseUp])
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
             guard let self else { return }
-            if self.openingGeminiFromShortcut {
-                self.store.startRefreshing()
-            } else if self.panel == nil && self.setupWindow == nil && self.settingsWindow == nil {
+            if self.panel == nil && self.setupWindow == nil && self.settingsWindow == nil {
                 self.openInitialView()
             }
         }
@@ -1022,6 +1087,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             store.startRefreshing()
             showPanel()
         }
+    }
+
+    private func switchAccount(_ card: QuotaCard) {
+        Task { @MainActor [weak self] in await self?.store.switchLogin(card) }
     }
 
     private func showSetup(provider: QuotaProvider? = nil) {
@@ -1067,7 +1136,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         window.contentView = NSHostingView(rootView: BoardSettingsView(
             store: store, provider: provider ?? .codex,
             addAccounts: { [weak self] in self?.showSetup(provider: $0) },
-            switchGemini: { [weak self] in self?.switchGeminiDesktop($0) }
+            switchAccount: { [weak self] in self?.switchAccount($0) }
         ))
         window.center()
         settingsWindow = window
@@ -1080,16 +1149,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
               let screen = anchorWindow.screen ?? NSScreen.main else { return nil }
         let visible = screen.visibleFrame.insetBy(dx: 8, dy: 5)
         let width: CGFloat
-        if let provider { width = provider.hasMultipleAccounts ? 510 : 300 }
-        else { width = 420 }
+        if let provider { width = store.cards.filter { $0.provider == provider.rawValue }.count > 1 ? 510 : 300 }
+        else { width = 490 }
         let panelWidth = min(width, visible.width)
         let height: CGFloat
         if let provider {
             let accounts = store.cards.filter { $0.provider == provider.rawValue }
             let windows = accounts.map { $0.windows.count }.max() ?? 0
-            let additionalRows = min(2, max(0, (windows - 1) / 2))
+            let additionalRows = max(0, (windows - 1) / 2)
             let accountRows = max(0, (accounts.count - 1) / 3)
-            height = 249 + CGFloat(additionalRows) * 104 + CGFloat(accountRows) * 152
+            height = 270 + CGFloat(additionalRows + accountRows) * 104 + CGFloat(accountRows) * 55
         } else {
             height = 187
         }
@@ -1127,18 +1196,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
 
         let bounds = NSRect(origin: .zero, size: frame.size)
-        let backdrop = FrostedBackdrop(frame: bounds)
+        let backdrop = NSGlassEffectView(frame: bounds)
+        backdrop.style = .regular
+        backdrop.cornerRadius = 22
         let host = NSHostingView(rootView: MenuBoardView(
             store: store,
             provider: provider,
-            switchGemini: { [weak self] in self?.switchGeminiDesktop($0) },
             showSettings: { [weak self] in self?.showSettings($0) },
             navigate: { [weak self] page in self?.navigate(to: page) }
         ))
         host.sizingOptions = []
         host.frame = bounds
         host.autoresizingMask = [.width, .height]
-        backdrop.addSubview(host)
+        backdrop.contentView = host
         next.contentView = backdrop
         backdrop.layoutSubtreeIfNeeded()
 
@@ -1175,21 +1245,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             rename.submenu = names
             menu.addItem(rename)
         }
-        if let card = linkAccount, card.geminiRoute != nil {
-            menu.addItem(makeItem("切换 Mac 版 Gemini", action: #selector(switchGeminiAccount(_:)),
-                                  value: card.id, symbol: "arrow.left.arrow.right"))
-            menu.addItem(makeItem("打开 Gemini 网页版", action: #selector(openGeminiChat(_:)),
-                                  value: card.id, symbol: "arrow.up.right"))
-            menu.addItem(makeItem("查看网页版用量", action: #selector(openGeminiUsage(_:)),
-                                  value: card.id, symbol: "chart.bar"))
-        } else {
-            if let card = linkAccount, let usage = URL(string: card.url) {
-                menu.addItem(makeItem("查看官方用量", action: #selector(openDetailLink(_:)),
-                                      value: usage, symbol: "chart.bar"))
-            }
-            menu.addItem(makeItem("打开服务官网", action: #selector(openDetailLink(_:)),
-                                  value: provider.website, symbol: "arrow.up.right"))
+        if let card = linkAccount, let usage = URL(string: card.url) {
+            menu.addItem(makeItem("查看官方用量", action: #selector(openDetailLink(_:)),
+                                  value: usage, symbol: "chart.bar"))
         }
+        menu.addItem(makeItem("打开服务官网", action: #selector(openDetailLink(_:)),
+                              value: provider.website, symbol: "arrow.up.right"))
         return menu
     }
 
@@ -1200,61 +1261,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     @objc private func renameDetailAccount(_ item: NSMenuItem) {
         store.renamingAccount = account(from: item)
-    }
-
-    @objc private func openGeminiChat(_ item: NSMenuItem) {
-        if let card = account(from: item) { store.openGemini(card) }
-    }
-
-    @objc private func switchGeminiAccount(_ item: NSMenuItem) {
-        if let card = account(from: item) { switchGeminiDesktop(card) }
-    }
-
-    private func switchGeminiDesktop(_ card: QuotaCard) {
-        guard card.geminiRoute != nil, card.emailPrefix != nil, !switchingGemini else { return }
-        geminiVerification?.cancel()
-        switchingGemini = true
-        hidePanel()
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            defer { self.switchingGemini = false }
-            switch await GeminiDesktop.select(email: card.email) {
-            case .submitted(let pid):
-                self.geminiVerification = Task { @MainActor [weak self] in
-                    if await GeminiDesktop.verifyAfterRestart(from: pid, email: card.email), !Task.isCancelled {
-                        self?.store.recordGeminiSelection(card)
-                    }
-                }
-            case .current:
-                self.store.recordGeminiSelection(card)
-            case .permissionNeeded:
-                self.showGeminiMessage("允许额度看板切换 Mac 版 Gemini",
-                                       "在「系统设置 → 隐私与安全性 → 辅助功能」启用额度看板，再点一次账号。",
-                                       offerSettings: true)
-            case .appMissing:
-                self.showGeminiMessage("无法打开 Mac 版 Gemini", "请确认已安装 Google 的 Gemini Mac 客户端。")
-            case .accountMenuMissing:
-                self.showGeminiMessage("未找到 Gemini 的账号菜单", "打开 Gemini 的侧栏，再点左下角头像切换账号。")
-            case .accountMissing:
-                self.showGeminiMessage("未能匹配 Gemini 账号", "请在 Mac 版 Gemini 左下角头像菜单检查「\(self.store.displayName(for: card))」。如果还没有登录该账号，先选「添加账号」，然后重试。")
-            case .actionUnavailable:
-                self.showGeminiMessage("Gemini 暂未接受切换", "可以在 Gemini 左下角的头像菜单直接选择账号。")
-            }
-        }
-    }
-
-    @MainActor private func showGeminiMessage(_ title: String, _ message: String, offerSettings: Bool = false) {
-        NSApp.activate(ignoringOtherApps: true)
-        let alert = NSAlert()
-        alert.messageText = title
-        alert.informativeText = message
-        if offerSettings { alert.addButton(withTitle: "打开辅助功能设置") }
-        alert.addButton(withTitle: "关闭")
-        if alert.runModal() == .alertFirstButtonReturn, offerSettings { GeminiDesktop.requestPermission() }
-    }
-
-    @objc private func openGeminiUsage(_ item: NSMenuItem) {
-        if let card = account(from: item) { store.openGemini(card, page: "usage") }
     }
 
     @objc private func openDetailLink(_ item: NSMenuItem) {
@@ -1312,44 +1318,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         return true
     }
 
-    func application(_ sender: NSApplication, openFiles filenames: [String]) {
-        let directory = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/QuotaBoard/gemini-desktop-requests")
-        guard filenames.count == 1, let filename = filenames.first else {
-            sender.reply(toOpenOrPrint: .failure)
-            return
-        }
-        let request = URL(fileURLWithPath: filename).standardizedFileURL
-        guard request.deletingLastPathComponent().path == directory.path,
-              request.pathExtension == "json", UUID(uuidString: request.deletingPathExtension().lastPathComponent) != nil,
-              let data = try? Data(contentsOf: request),
-              let payload = try? JSONDecoder().decode(GeminiDesktopRequest.self, from: data) else {
-            sender.reply(toOpenOrPrint: .failure)
-            return
-        }
-        try? FileManager.default.removeItem(at: request)
-        guard abs(Date().timeIntervalSince1970 - payload.createdAt) < 60 else {
-            sender.reply(toOpenOrPrint: .failure)
-            return
-        }
-        openingGeminiFromShortcut = true
-        sender.reply(toOpenOrPrint: .success)
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            if let card = self.store.cards.first(where: { $0.id == payload.accountID && $0.geminiRoute != nil }) {
-                self.switchGeminiDesktop(card)
-            } else {
-                self.showGeminiMessage("找不到这个 Gemini 账号", "先在额度看板刷新 Gemini 账号列表，再试一次。")
-            }
-        }
-    }
     func applicationWillTerminate(_ notification: Notification) { store.stop() }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
-}
-
-private struct GeminiDesktopRequest: Decodable {
-    let accountID: String
-    let createdAt: TimeInterval
 }
 
 @main
