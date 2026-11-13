@@ -26,12 +26,14 @@ USER_HOME = Path.home()
 KIRO_ACCOUNTS = USER_HOME / "Library/Application Support/Kiro CLI Accounts"
 BOARD_DATA = USER_HOME / "Library/Application Support/QuotaBoard"
 CARDS = [
+    ("codex-default", "Codex", "当前登录账号"),
     ("codex-n", "Codex", "Codex 账号 1"),
     ("codex-b", "Codex", "Codex 账号 2"),
     ("codex-w", "Codex", "Codex 账号 3"),
     ("kiro-1", "Kiro", "账号 1"),
     ("kiro-2", "Kiro", "账号 2"),
     ("kiro-3", "Kiro", "账号 3"),
+    ("kiro-default", "Kiro", "当前登录账号"),
     ("cursor", "Cursor", "当前登录账号"),
     ("gemini", "Gemini", "网页版 · Google AI Pro"),
 ]
@@ -84,8 +86,16 @@ def claims(path):
         return None
 
 
+def codex_home(card_id):
+    return USER_HOME / (".codex" if card_id == "codex-default" else "." + card_id)
+
+
+def kiro_home(card_id):
+    return USER_HOME if card_id == "kiro-default" else KIRO_ACCOUNTS / card_id.removeprefix("kiro-")
+
+
 def codex_email(card_id):
-    payload = codex_payload(USER_HOME / f".codex-{card_id[-1]}/auth.json")
+    payload = codex_payload(codex_home(card_id) / "auth.json")
     profile = payload.get("https://api.openai.com/profile")
     for email in (payload.get("email"), profile.get("email") if isinstance(profile, dict) else None):
         if isinstance(email, str) and "@" in email:
@@ -109,6 +119,17 @@ def kiro_identity(home):
         return None
 
 
+def kiro_signed_in(home):
+    path = kiro_database(home)
+    if not path.is_file():
+        return False
+    try:
+        with sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=0.4) as db:
+            return db.execute("SELECT 1 FROM auth_kv WHERE key='kirocli:odic:token'").fetchone() is not None
+    except sqlite3.Error:
+        return False
+
+
 def active_accounts():
     active = {}
     try:
@@ -123,8 +144,10 @@ def active_accounts():
             f"codex-{slot}" for slot in ("n", "b", "w")
             if claims(USER_HOME / f".codex-{slot}/auth.json") == current_codex
         ]
-        if len(matches) == 1:
+        if matches:
             active["Codex"] = matches[0]
+        else:
+            active["Codex"] = "codex-default"
 
     slots = ("1", "2", "3")
     try:
@@ -137,8 +160,12 @@ def active_accounts():
         current_kiro = kiro_identity(USER_HOME)
         if current_kiro:
             matches = [slot for slot in slots if kiro_identity(KIRO_ACCOUNTS / slot) == current_kiro]
-            if len(matches) == 1:
+            if matches:
                 active["Kiro"] = f"kiro-{matches[0]}"
+            else:
+                active["Kiro"] = "kiro-default"
+    if cursor_email():
+        active["Cursor"] = "cursor"
     return active
 
 
@@ -150,16 +177,16 @@ def environment(card_id):
     env["KIRO_NO_AUTO_UPDATE"] = "1"
     env["KIRO_SKIP_BINARY_PINNING"] = "1"
     if card_id.startswith("codex-"):
-        home = USER_HOME / (".codex-" + card_id[-1])
+        home = codex_home(card_id)
         expected = claims(home / "auth.json")
         if expected is None:
-            raise ReadError("not_logged_in", "此账号未登录，请先使用对应快捷入口登录")
+            raise ReadError("not_logged_in", "请在 Codex 登录后重新扫描账号")
         default = USER_HOME / ".codex"
         if claims(default / "auth.json") == expected:
             home = default
         env["CODEX_HOME"] = str(home)
     elif card_id.startswith("kiro-"):
-        home = KIRO_ACCOUNTS / card_id[-1]
+        home = kiro_home(card_id)
         if not kiro_database(home).is_file():
             raise ReadError("not_logged_in", "未找到此 Kiro 账号，请先登录")
         env["HOME"] = str(home)
@@ -167,22 +194,51 @@ def environment(card_id):
     return env
 
 
+def cursor_email():
+    path = USER_HOME / "Library/Application Support/Cursor/User/globalStorage/state.vscdb"
+    if not path.is_file():
+        return ""
+    try:
+        with sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=0.4) as db:
+            row = db.execute("SELECT value FROM ItemTable WHERE key='cursorAuth/cachedEmail'").fetchone()
+        return row[0] if row and isinstance(row[0], str) else ""
+    except sqlite3.Error:
+        return ""
+
+
 def identity_key(card_id):
     try:
         if card_id.startswith("codex-"):
-            value = claims(USER_HOME / (".codex-" + card_id[-1]) / "auth.json")
+            value = claims(codex_home(card_id) / "auth.json")
         elif card_id.startswith("kiro-"):
-            value = kiro_identity(KIRO_ACCOUNTS / card_id[-1])
+            value = kiro_identity(kiro_home(card_id))
         elif card_id == "cursor":
-            path = USER_HOME / "Library/Application Support/Cursor/User/globalStorage/state.vscdb"
-            with sqlite3.connect(path.as_uri() + "?mode=ro", uri=True) as db:
-                row = db.execute("SELECT value FROM ItemTable WHERE key='cursorAuth/cachedEmail'").fetchone()
-            value = row[0] if row else None
+            value = cursor_email()
         else:
             return None
         return hashlib.sha256(json.dumps(value).encode()).hexdigest() if value else None
     except (OSError, sqlite3.Error, ValueError):
         return None
+
+
+def discover_accounts():
+    """List local account identifiers without fetching quotas or prompting for access."""
+    unique = {}
+    active = active_accounts()
+    for card_id, provider, label in CARDS:
+        if provider == "Gemini":
+            continue
+        if provider == "Kiro" and not kiro_signed_in(kiro_home(card_id)):
+            continue
+        identity = identity_key(card_id)
+        if not identity:
+            continue
+        email = codex_email(card_id) if provider == "Codex" else cursor_email() if provider == "Cursor" else ""
+        key = (provider, identity)
+        if key not in unique or active.get(provider) == card_id:
+            unique[key] = {"id": card_id, "provider": provider, "label": label,
+                           "email": email, "identityKey": identity}
+    return list(unique.values())
 
 
 def auth_session(provider, interactive):
@@ -442,7 +498,8 @@ def gemini_account_card(session, slot, info):
         period = pool.get("gxu")
         reset = period.get("windowRefreshesAt") if isinstance(period, dict) else None
         windows.append({"title": title, "remaining": 100 * (1 - min(1, used)),
-                        "resetsAt": reset if isinstance(reset, str) else None, "detail": None})
+                        "resetsAt": reset if isinstance(reset, str) else None, "detail": None,
+                        "minutes": 300 if pool_type == "GXU_FIVE_HOURLY" else 10080})
     pro = info.get("subscriptionTier") == "TIER1"
     return {
         "id": account_id, "provider": "Gemini", "label": f"Gemini {slot + 1}",
@@ -456,8 +513,18 @@ def gemini_account_card(session, slot, info):
     }
 
 
-def read_gemini_accounts(interactive):
+def read_gemini_accounts(interactive, selected_ids=None):
     session = auth_session("gemini", interactive)
+    if selected_ids is not None:
+        cards = []
+        for slot, (account_id, _) in gemini_identities(session):
+            if account_id in selected_ids:
+                info = gemini_slot_usage(session, slot)
+                if info is not None:
+                    card = gemini_account_card(session, slot, info)
+                    if card["id"] == account_id:
+                        cards.append(card)
+        return cards
     slots = []
     with ThreadPoolExecutor(max_workers=4) as pool:
         exhausted = False
@@ -478,6 +545,28 @@ def read_gemini_accounts(interactive):
     for card in cards:
         unique.setdefault(card["id"], card)
     return list(unique.values())
+
+
+def gemini_identities(session):
+    seen = set()
+    for slot in range(GEMINI_MAX_SLOTS):
+        try:
+            identity = gemini_slot_identity(session, slot)
+        except ReadError as error:
+            if slot and error.code in ("not_logged_in", "format_changed"):
+                break
+            raise
+        if identity[0] in seen:
+            break
+        seen.add(identity[0])
+        yield slot, identity
+
+
+def discover_gemini_accounts():
+    session = auth_session("gemini", True)
+    return [{"id": account_id, "provider": "Gemini", "label": f"Gemini {slot + 1}",
+             "email": email, "identityKey": account_id, "geminiRoute": gemini_web_route(session, slot)}
+            for slot, (account_id, email) in gemini_identities(session)]
 
 
 def open_gemini_account(account_id, slot, page):
@@ -561,6 +650,7 @@ def normalize(card_id, provider, label, row, session=None):
         windows.append({
             "title": title, "remaining": max(0, min(100, 100 - used)),
             "resetsAt": window.get("resetsAt"), "detail": None,
+            "minutes": minutes if type(minutes) is int and minutes > 0 else None,
         })
     for window in usage.get("extraRateWindows") or []:
         if not isinstance(window, dict):
@@ -571,6 +661,7 @@ def normalize(card_id, provider, label, row, session=None):
                 "title": window.get("label") or window.get("title") or "额外额度",
                 "remaining": max(0, min(100, 100 - used)),
                 "resetsAt": window.get("resetsAt"), "detail": None,
+                "minutes": window.get("windowMinutes") if type(window.get("windowMinutes")) is int else None,
             })
     if provider == "Cursor" and not any(window.get("resetsAt") for window in windows):
         raise ReadError("network", "Cursor 暂未返回完整的额度周期，请稍后刷新")
@@ -628,6 +719,8 @@ def main():
     parser.add_argument("--interactive", action="store_true")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--active", action="store_true", help="read local account selection without fetching quotas")
+    parser.add_argument("--discover", choices=("local", "gemini"))
+    parser.add_argument("--selected", help="JSON mapping of selected account IDs to their expected identities")
     parser.add_argument("--gemini-open")
     parser.add_argument("--gemini-desktop")
     parser.add_argument("--slot", type=int)
@@ -636,6 +729,15 @@ def main():
     os.umask(0o077)
     if args.active:
         print(json.dumps(active_accounts()))
+        return
+    if args.discover:
+        try:
+            accounts = discover_accounts() if args.discover == "local" else discover_gemini_accounts()
+            print(json.dumps({"accounts": accounts}, ensure_ascii=False))
+        except ReadError as error:
+            print(json.dumps({"message": str(error)}, ensure_ascii=False))
+        except (OSError, ValueError, subprocess.SubprocessError):
+            print(json.dumps({"message": "暂时无法扫描账号，请稍后重试。"}, ensure_ascii=False))
         return
     if args.gemini_desktop:
         if not re.fullmatch(r"gemini-[0-9a-f]{64}", args.gemini_desktop):
@@ -659,7 +761,13 @@ def main():
         except OSError:
             print(json.dumps({"message": "未能保存当前 Gemini 账号"}, ensure_ascii=False))
         return
-    requested = [item for item in CARDS if not args.account or item[0] == args.account]
+    selected = json.loads(args.selected) if args.selected is not None else None
+    gemini_ids = None if selected is None else {
+        key for key, identity in selected.items() if key.startswith("gemini-") and key == identity
+    }
+    requested = [item for item in CARDS if (not args.account or item[0] == args.account) and (
+        selected is None or item[0] in selected or (item[0] == "gemini" and gemini_ids)
+    )]
     if not requested:
         parser.error("unknown account")
     # One native prompt at a time. Background quota reads never request Keychain UI.
@@ -668,10 +776,23 @@ def main():
     results = {}
     gemini_cards = []
     gemini_error = None
+    def read_selected(spec):
+        card_id, provider, label = spec
+        if selected is None:
+            return read_card(spec, args.interactive)
+        if identity_key(card_id) == selected[card_id]:
+            card = read_card(spec, args.interactive)
+            if card.get("identityKey") == selected[card_id]:
+                return card
+        return {"id": card_id, "provider": provider, "label": label, "email": "", "plan": provider,
+                "status": "error", "message": "登录账号已变化，请在设置中重新导入",
+                "windows": [], "details": [], "source": "等待读取", "url": URLS[provider],
+                "errorCode": "account_changed"}
+
     with ThreadPoolExecutor(max_workers=4) as pool:
         jobs = {
-            (pool.submit(read_gemini_accounts, args.interactive) if spec[0] == "gemini"
-             else pool.submit(read_card, spec, args.interactive)): spec[0] for spec in requested
+            (pool.submit(read_gemini_accounts, args.interactive, gemini_ids) if spec[0] == "gemini"
+             else pool.submit(read_selected, spec)): spec[0] for spec in requested
         }
         for future in as_completed(jobs):
             if jobs[future] == "gemini":

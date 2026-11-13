@@ -6,6 +6,7 @@ struct QuotaWindow: Codable, Identifiable {
     let remaining: Double
     let resetsAt: String?
     let detail: String?
+    var minutes: Int?
     var id: String { title }
 
     var englishTitle: String {
@@ -18,6 +19,11 @@ struct QuotaWindow: Codable, Identifiable {
         case "额外额度": return "Additional"
         default: return title
         }
+    }
+
+    var durationForDisplay: Int {
+        let known = ["5 Hours": 300, "Daily": 1440, "Weekly": 10080, "Monthly": 43200]
+        return minutes ?? known[englishTitle] ?? Int.max
     }
 }
 
@@ -64,17 +70,40 @@ struct QuotaCard: Codable, Identifiable {
     }
 }
 
+struct ImportAccount: Codable, Identifiable {
+    let id: String
+    let provider: String
+    let label: String
+    let email: String
+    let identityKey: String
+    var geminiRoute: GeminiRoute?
+
+    var selectionKey: String { provider + ":" + identityKey }
+
+    var placeholder: QuotaCard {
+        var card = QuotaCard.initial(id, provider, label)
+        card.email = email
+        card.identityKey = identityKey
+        card.geminiRoute = geminiRoute
+        return card
+    }
+}
+
+private struct DiscoveryResult: Decodable {
+    var accounts: [ImportAccount]?
+    var message: String?
+}
+
 final class BoardStore: ObservableObject {
-    @Published var cards: [QuotaCard] = [
-        .initial("codex-n", "Codex", "Codex 账号 1"),
-        .initial("codex-b", "Codex", "Codex 账号 2"),
-        .initial("codex-w", "Codex", "Codex 账号 3"),
-        .initial("kiro-1", "Kiro", "账号 1"),
-        .initial("kiro-2", "Kiro", "账号 2"),
-        .initial("kiro-3", "Kiro", "账号 3"),
-        .initial("cursor", "Cursor", "当前登录账号"),
-        .initial("gemini", "Gemini", "网页版 · Google AI Pro")
-    ]
+    private static let importedKey = "ImportedQuotaAccounts"
+    @Published var cards: [QuotaCard] = []
+    @Published private(set) var imported: [ImportAccount] = []
+    @Published private(set) var hiddenProviders: Set<String> =
+        Set(UserDefaults.standard.stringArray(forKey: "HiddenQuotaProviders") ?? [])
+    @Published private(set) var preferredAccounts: [String: String] =
+        UserDefaults.standard.dictionary(forKey: "OverviewQuotaAccounts") as? [String: String] ?? [:]
+    private(set) var isConfigured = false
+    private var refreshAfterChange = false
     @Published private(set) var activeAccounts: [String: String] = [:]
     @Published var refreshing = false
     @Published var refreshingIDs: Set<String> = []
@@ -93,18 +122,84 @@ final class BoardStore: ObservableObject {
         resources = Bundle.main.resourceURL!
         cacheURL = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support/QuotaBoard/snapshot.json")
+        if let data = UserDefaults.standard.data(forKey: Self.importedKey),
+           let accounts = try? JSONDecoder().decode([ImportAccount].self, from: data) {
+            isConfigured = true
+            imported = accounts
+            cards = accounts.map(\.placeholder)
+        }
         if let bytes = try? Data(contentsOf: cacheURL),
            let stored = try? JSONDecoder().decode([QuotaCard].self, from: bytes) {
             for card in stored {
                 var cached = card
                 cached.status = "cached"
-                if let index = cards.firstIndex(where: { $0.id == card.id }) {
+                if let index = cards.firstIndex(where: { $0.id == card.id && $0.identityKey == card.identityKey }) {
                     cards[index] = cached
-                } else if card.provider == "Gemini", card.geminiRoute != nil {
-                    cards.append(cached)
                 }
             }
-            if cards.contains(where: { $0.geminiRoute != nil }) { cards.removeAll { $0.id == "gemini" } }
+        }
+    }
+
+    func saveImports(_ accounts: [ImportAccount]) {
+        guard let data = try? JSONEncoder().encode(accounts) else { return }
+        let cache = (try? Data(contentsOf: cacheURL)).flatMap { try? JSONDecoder().decode([QuotaCard].self, from: $0) } ?? []
+        let oldCards = cards + cache.map { card in
+            var cached = card
+            cached.status = "cached"
+            return cached
+        }
+        isConfigured = true
+        imported = accounts
+        UserDefaults.standard.set(data, forKey: Self.importedKey)
+        cards = accounts.map { account in
+            oldCards.first { $0.id == account.id && $0.identityKey == account.identityKey } ?? account.placeholder
+        }
+        persist()
+        if refreshing { refreshAfterChange = true }
+        else if timer != nil { refresh() }
+    }
+
+    func setVisible(_ visible: Bool, provider: String) {
+        if visible { hiddenProviders.remove(provider) } else { hiddenProviders.insert(provider) }
+        UserDefaults.standard.set(hiddenProviders.sorted(), forKey: "HiddenQuotaProviders")
+    }
+
+    func followLogin(for provider: String) {
+        preferredAccounts.removeValue(forKey: provider)
+        UserDefaults.standard.set(preferredAccounts, forKey: "OverviewQuotaAccounts")
+    }
+
+    func selectOverviewAccount(_ card: QuotaCard) {
+        guard let identity = card.identityKey else { return }
+        preferredAccounts[card.provider] = identity
+        UserDefaults.standard.set(preferredAccounts, forKey: "OverviewQuotaAccounts")
+    }
+
+    func overviewCard(for provider: String) -> QuotaCard? {
+        let candidates = cards.filter { $0.provider == provider }
+        if let preferred = preferredAccounts[provider],
+           let card = candidates.first(where: { $0.identityKey == preferred }) { return card }
+        return candidates.first { $0.id == activeAccounts[provider] } ?? candidates.first
+    }
+
+    func discover(_ source: String, completion: @escaping ([ImportAccount], String?) -> Void) {
+        let script = resources.appendingPathComponent("worker.py").path
+        DispatchQueue.global(qos: .userInitiated).async {
+            let task = Process()
+            task.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+            task.arguments = [script, "--discover", source]
+            let pipe = Pipe()
+            task.standardOutput = pipe
+            task.standardError = FileHandle.nullDevice
+            var result: DiscoveryResult?
+            if (try? task.run()) != nil {
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                task.waitUntilExit()
+                result = try? JSONDecoder().decode(DiscoveryResult.self, from: data)
+            }
+            let accounts = result?.accounts ?? []
+            let message = result == nil ? "账号扫描未完成，请重试。" : result?.message
+            DispatchQueue.main.async { completion(accounts, message) }
         }
     }
 
@@ -200,16 +295,19 @@ final class BoardStore: ObservableObject {
     }
 
     func refresh(account: String? = nil, interactive: Bool = false) {
-        guard !refreshing else { return }
+        let requested = imported.filter { selection in
+            account == nil || selection.id == account || (account == "gemini" && selection.provider == "Gemini")
+        }
+        guard !refreshing, !requested.isEmpty else { return }
+        let selected = Dictionary(requested.map { ($0.id, $0.identityKey) }, uniquingKeysWith: { _, newest in newest })
+        guard let selectedJSON = try? JSONEncoder().encode(selected) else { return }
         refreshing = true
-        refreshingIDs = Set(cards.compactMap { card in
-            let id = card.provider == "Gemini" ? "gemini" : card.id
-            return account == nil || id == account ? id : nil
-        })
+        refreshingIDs = Set(requested.map { $0.provider == "Gemini" ? "gemini" : $0.id })
         processMessage = nil
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
-        task.arguments = [resources.appendingPathComponent("worker.py").path]
+        task.arguments = [resources.appendingPathComponent("worker.py").path,
+                          "--selected", String(decoding: selectedJSON, as: UTF8.self)]
         if let account = account { task.arguments! += ["--account", account] }
         if interactive { task.arguments! += ["--interactive"] }
         var environment = ProcessInfo.processInfo.environment
@@ -240,7 +338,12 @@ final class BoardStore: ObservableObject {
                     if let raw = object["card"],
                        let bytes = try? JSONSerialization.data(withJSONObject: raw),
                        let card = try? JSONDecoder().decode(QuotaCard.self, from: bytes) {
-                        DispatchQueue.main.async { self?.accept(card) }
+                        DispatchQueue.main.async {
+                            guard self?.imported.contains(where: {
+                                $0.id == card.id && $0.identityKey == selected[card.id]
+                            }) == true else { return }
+                            self?.accept(card)
+                        }
                     }
                     if let raw = object["geminiCards"],
                        let bytes = try? JSONSerialization.data(withJSONObject: raw),
@@ -262,6 +365,11 @@ final class BoardStore: ObservableObject {
                 self.process = nil
                 self.lastRefresh = Date()
                 self.persist()
+                self.updateActiveAccounts()
+                if self.refreshAfterChange {
+                    self.refreshAfterChange = false
+                    self.refresh()
+                }
             }
         }
     }
@@ -270,6 +378,10 @@ final class BoardStore: ObservableObject {
         guard let index = cards.firstIndex(where: { $0.id == incoming.id }) else { return }
         var card = incoming
         let previous = cards[index]
+        if card.errorCode == "account_changed" {
+            card.email = previous.email
+            card.identityKey = previous.identityKey
+        }
         let sameIdentity = incoming.identityKey.map { $0 == previous.identityKey } ?? false
         if sameIdentity, card.emailPrefix == nil {
             card.email = previous.email
@@ -287,7 +399,16 @@ final class BoardStore: ObservableObject {
     }
 
     private func acceptGemini(_ accounts: [QuotaCard]) {
-        cards = cards.filter { $0.provider != "Gemini" } + accounts
+        let byID = Dictionary(accounts.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        let selected = imported.filter { $0.provider == "Gemini" }
+        cards = cards.filter { $0.provider != "Gemini" } + selected.map { account in
+            if let card = byID[account.id] { return card }
+            var card = account.placeholder
+            card.status = "error"
+            card.message = "浏览器中未找到此账号，请登录后重新扫描。"
+            card.errorCode = "not_logged_in"
+            return card
+        }
         refreshingIDs.remove("gemini")
     }
 
@@ -296,7 +417,7 @@ final class BoardStore: ObservableObject {
         let message = error["message"] ?? "Gemini 账号读取失败"
         let retryable = ["network", "rate_limited", "format_changed", "read_failed"].contains(code)
         let known = cards.filter { $0.provider == "Gemini" && $0.geminiRoute != nil }
-        let accounts = retryable && !known.isEmpty ? known : [.initial("gemini", "Gemini", "Gemini")]
+        let accounts = retryable && !known.isEmpty ? known : imported.filter { $0.provider == "Gemini" }.map(\.placeholder)
         acceptGemini(accounts.map { account in
             var card = account
             card.status = card.windows.isEmpty ? "error" : "stale"
@@ -340,7 +461,7 @@ func refreshDescription(_ value: String?, now: Date) -> String {
     return "\(minutes)分钟后重置"
 }
 
-private enum QuotaProvider: String, CaseIterable {
+enum QuotaProvider: String, CaseIterable {
     case codex = "Codex", kiro = "Kiro", cursor = "Cursor", gemini = "Gemini"
 
     var asset: String { self == .codex ? "openai" : rawValue.lowercased() }
@@ -372,16 +493,23 @@ private enum QuotaProvider: String, CaseIterable {
         }
     }
 
-    func summaryWindows(for card: QuotaCard?) -> [QuotaWindow] {
-        guard let card else { return [] }
-        let namedWindows = ["5 Hours", "Weekly"].compactMap { title in
-            card.windows.first(where: { $0.englishTitle == title })
+    var loginInstructions: String {
+        switch self {
+        case .codex: return "在 Codex 登录后，回到这里重新扫描。"
+        case .kiro: return "在 Kiro CLI 登录后，回到这里重新扫描。"
+        case .cursor: return "在 Cursor 桌面应用登录后，回到这里重新扫描。"
+        case .gemini: return "先在 Chrome、Edge 或 Brave 登录 Gemini，再点「查找 Gemini 账号」。"
         }
-        return namedWindows.isEmpty ? Array(card.windows.prefix(2)) : namedWindows
+    }
+
+    func shortestWindow(for card: QuotaCard?) -> QuotaWindow? {
+        return card?.windows.min { left, right in
+            left.durationForDisplay < right.durationForDisplay
+        }
     }
 }
 
-private struct BrandMark: View {
+struct BrandMark: View {
     let provider: QuotaProvider
     var size: CGFloat = 20
     private static let icons: [QuotaProvider: NSImage] = Dictionary(
@@ -439,7 +567,7 @@ private struct QuotaRing: View {
                     .rotationEffect(.degrees(135))
             }
             Text(Self.percentage(remaining))
-                .font(.system(size: size >= 50 ? 15 : 12, weight: .semibold, design: .rounded))
+                .font(.system(size: 11, weight: .semibold, design: .rounded))
                 .monospacedDigit().foregroundStyle(remaining == nil ? .secondary : .primary)
                 .lineLimit(1).minimumScaleFactor(0.75)
                 .frame(width: size - 9)
@@ -462,28 +590,23 @@ private struct ProviderRings: View {
 
     private var summary: String {
         guard let card else { return "未识别当前账号" }
-        let values = provider.summaryWindows(for: card).map { window in
-            "\(window.englishTitle) \(QuotaRing.percentage(window.remaining))"
-        }.joined(separator: "，")
         let name = accountName ?? card.label
-        return values.isEmpty ? "\(name)，暂无额度" : "\(name)，\(values)"
+        guard let window = provider.shortestWindow(for: card) else { return "\(name)，暂无额度" }
+        return "\(name)，\(window.englishTitle)，剩余 \(QuotaRing.percentage(window.remaining))"
     }
 
     var body: some View {
-        let windows = provider.summaryWindows(for: card)
         Button(action: select) {
-            VStack(spacing: 8) {
-                BrandMark(provider: provider).frame(height: 22)
-                HStack(spacing: 8) {
-                    if windows.isEmpty {
-                        overviewRing(nil)
-                    } else {
-                        ForEach(Array(windows.enumerated()), id: \.offset) { _, window in
-                            overviewRing(window)
-                        }
-                    }
+            VStack(spacing: 5) {
+                HStack(spacing: 4) {
+                    BrandMark(provider: provider, size: 15)
+                    Text(provider.rawValue).font(.system(size: 11, weight: .semibold))
                 }
+                Text(accountName ?? "待导入").font(.system(size: 11)).foregroundStyle(.secondary)
+                    .lineLimit(1).truncationMode(.middle)
+                overviewRing(provider.shortestWindow(for: card))
             }
+            .frame(maxWidth: .infinity)
             .padding(.horizontal, 6).padding(.vertical, 7)
             .background(.primary.opacity(hovered ? 0.065 : 0), in: RoundedRectangle(cornerRadius: 13))
             .contentShape(RoundedRectangle(cornerRadius: 13))
@@ -500,11 +623,11 @@ private struct ProviderRings: View {
         return VStack(spacing: 4) {
             QuotaRing(remaining: window?.remaining, tint: provider.tint(for: scheme),
                       size: ringSize, cached: window != nil && card?.status != "ok")
-            Text(title == "5 Hours" ? "5h" : title ?? "")
-                .font(.system(size: 9, weight: .medium))
+            Text(title ?? "暂无额度")
+                .font(.system(size: 11, weight: .medium))
                 .foregroundStyle(.secondary)
                 .lineLimit(1).minimumScaleFactor(0.8)
-                .frame(width: ringSize + 2, height: 12)
+                .frame(minWidth: ringSize + 4)
         }
     }
 }
@@ -522,7 +645,7 @@ private struct AccountRings: View {
         HStack(spacing: 5) {
             if isActive && provider.hasMultipleAccounts {
                 Circle().fill(provider.tint(for: scheme)).frame(width: 4, height: 4)
-                    .help("当前账号").accessibilityLabel("Current")
+                    .help("总览账号").accessibilityLabel("总览账号")
             }
             Text(title).font(.system(size: 11, weight: .semibold))
                 .lineLimit(1).truncationMode(.middle)
@@ -543,15 +666,19 @@ private struct AccountRings: View {
                 accountTitle.help(title)
             }
 
+            if isActive {
+                Text("总览账号").font(.system(size: 11)).foregroundStyle(.secondary)
+            }
             if card.windows.isEmpty {
                 Text(card.errorCode == "keychain_required" ? "点刷新以授权读取" : card.message ?? "等待读取")
-                    .font(.system(size: 10)).foregroundStyle(.secondary)
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
                     .multilineTextAlignment(.center).fixedSize(horizontal: false, vertical: true)
                     .frame(minHeight: 60)
             } else {
                 LazyVGrid(columns: Array(repeating: GridItem(.fixed(card.windows.count == 1 ? 132 : 67), spacing: 6),
                                         count: min(2, card.windows.count)), spacing: 12) {
-                    ForEach(Array(card.windows.enumerated()), id: \.offset) { _, window in
+                    ForEach(Array(card.windows.sorted { $0.durationForDisplay < $1.durationForDisplay }.enumerated()),
+                            id: \.offset) { _, window in
                         metric(window)
                     }
                 }
@@ -567,14 +694,14 @@ private struct AccountRings: View {
         return VStack(spacing: 3) {
             QuotaRing(remaining: window.remaining, tint: provider.tint(for: scheme), size: 54,
                       cached: card.status != "ok")
-            Text(window.englishTitle).font(.system(size: 10, weight: .medium))
+            Text(window.englishTitle).font(.system(size: 11, weight: .medium))
                 .lineLimit(1).minimumScaleFactor(0.8)
             if let detail = window.detail, !detail.isEmpty {
-                Text(detail).font(.system(size: 10, weight: .medium))
+                Text(detail).font(.system(size: 11, weight: .medium))
                     .lineLimit(1).minimumScaleFactor(0.8)
             }
             if window.resetsAt != nil {
-                Text(resetShort).font(.system(size: 9)).foregroundStyle(.secondary).lineLimit(1)
+                Text(resetShort).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
             }
         }.accessibilityElement(children: .ignore)
             .accessibilityLabel("\(window.englishTitle)，剩余 \(QuotaRing.percentage(window.remaining))，\(window.detail.map { $0 + "，" } ?? "")\(reset)\(card.status == "ok" ? "" : "，上次结果")")
@@ -582,7 +709,7 @@ private struct AccountRings: View {
     }
 }
 
-private struct RenameAccountView: View {
+struct RenameAccountView: View {
     let store: BoardStore
     let card: QuotaCard
     @State private var draft: String
@@ -596,8 +723,11 @@ private struct RenameAccountView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("修改显示名称").font(.headline)
-            TextField("账号名称", text: $draft).focused($focused).onSubmit(save)
+            Text("编辑账号").font(.headline)
+            LabeledContent("登录邮箱", value: card.email.isEmpty ? "暂未读取" : card.email)
+                .font(.subheadline)
+                .textSelection(.enabled)
+            TextField("显示名称", text: $draft).focused($focused).onSubmit(save)
             Text("留空恢复默认名称").font(.caption).foregroundStyle(.secondary)
             HStack {
                 Spacer()
@@ -616,145 +746,11 @@ private struct RenameAccountView: View {
     }
 }
 
-private struct GettingStartedView: View {
-    private enum Step: Int, CaseIterable {
-        case menuBar, overview, accounts
-
-        var title: String {
-            switch self {
-            case .menuBar: return "从菜单栏打开"
-            case .overview: return "查看剩余额度"
-            case .accounts: return "连接你的账号"
-            }
-        }
-
-        var instruction: String {
-            switch self {
-            case .menuBar: return "点屏幕右上角的柱状图图标，打开或收起额度看板。"
-            case .overview: return "圆环显示当前账号的剩余额度。点服务图标进入详情，查看其他账号、额度周期和重置时间。"
-            case .accounts: return "先在你使用的服务中登录，再回到看板刷新。可以从一个服务开始。"
-            }
-        }
-    }
-
-    let skip: () -> Void
-    let finish: () -> Void
-    @State private var step = Step.menuBar
-    @Environment(\.colorScheme) private var colorScheme
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            Text("第 \(step.rawValue + 1) 步，共 \(Step.allCases.count) 步")
-                .font(.subheadline).foregroundStyle(.secondary)
-            Text(step.title).font(.title2.weight(.semibold)).padding(.top, 6)
-                .accessibilityAddTraits(.isHeader)
-            Text(step.instruction).font(.body).foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true).padding(.top, 6)
-
-            Group {
-                switch step {
-                case .menuBar: menuBarExample
-                case .overview: quotaExample
-                case .accounts: accounts
-                }
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .padding(.vertical, 18)
-
-            Divider()
-            HStack(spacing: 10) {
-                Button("跳过", action: skip)
-                Spacer()
-                if step != .menuBar {
-                    Button("上一步") {
-                        if let previous = Step(rawValue: step.rawValue - 1) { step = previous }
-                    }
-                }
-                Button(step == .accounts ? "开始使用" : "下一步") {
-                    if let next = Step(rawValue: step.rawValue + 1) {
-                        step = next
-                    } else {
-                        finish()
-                    }
-                }
-                .keyboardShortcut(.defaultAction)
-            }.padding(.top, 14)
-        }
-        .padding(24)
-        .frame(width: 500, height: 430)
-    }
-
-    private var menuBarExample: some View {
-        VStack(spacing: 12) {
-            HStack(spacing: 14) {
-                Spacer(minLength: 24)
-                Image(systemName: "chart.bar.fill")
-                    .frame(width: 31, height: 26)
-                    .background(Color.accentColor.opacity(0.16), in: RoundedRectangle(cornerRadius: 6))
-                Image(systemName: "wifi").foregroundStyle(.secondary)
-                Image(systemName: "controlcenter").foregroundStyle(.secondary)
-                Text("9:41").monospacedDigit().foregroundStyle(.secondary)
-            }
-            .padding(.horizontal, 16).padding(.vertical, 7)
-            .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 10))
-            Text("额度看板图标").font(.footnote).foregroundStyle(.secondary)
-        }.accessibilityElement(children: .ignore)
-            .accessibilityLabel("菜单栏示意，柱状图图标是额度看板入口")
-    }
-
-    private var quotaExample: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("示例额度").font(.footnote.weight(.medium)).foregroundStyle(.secondary)
-            HStack(spacing: 36) {
-                quotaSample(.codex, remaining: 68, period: "5 Hours")
-                quotaSample(.cursor, remaining: 84, period: "Weekly")
-            }.frame(maxWidth: .infinity)
-        }
-        .padding(16)
-        .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 12))
-    }
-
-    private func quotaSample(_ provider: QuotaProvider, remaining: Double, period: String) -> some View {
-        VStack(spacing: 5) {
-            HStack(spacing: 5) {
-                BrandMark(provider: provider, size: 15)
-                Text(provider.rawValue).font(.subheadline.weight(.semibold))
-            }
-            QuotaRing(remaining: remaining, tint: provider.tint(for: colorScheme), size: 46)
-            Text(period).font(.footnote).foregroundStyle(.secondary)
-        }
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel("\(provider.rawValue)，\(period)，剩余 \(Int(remaining))%")
-    }
-
-    private var accounts: some View {
-        VStack(alignment: .leading, spacing: 11) {
-            accountRow(.codex, "用 Codex CLI 登录到 ~/.codex-n。其他账号可用 ~/.codex-b 和 ~/.codex-w。")
-            accountRow(.kiro, "用 Kiro CLI 登录到 ~/Library/Application Support/Kiro CLI Accounts/1。")
-            accountRow(.cursor, "在 Cursor 客户端登录，打开看板中的 Cursor 详情并刷新。")
-            accountRow(.gemini, "在 Chrome、Edge 或 Brave 登录 Google，打开 Gemini 详情并刷新。")
-            Text("读取 Cursor 或 Gemini 时，macOS 可能会显示钥匙串授权提示。")
-                .font(.footnote).foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-        }.frame(maxWidth: .infinity, alignment: .leading)
-    }
-
-    private func accountRow(_ provider: QuotaProvider, _ description: String) -> some View {
-        HStack(alignment: .top, spacing: 9) {
-            BrandMark(provider: provider, size: 16)
-            Text(provider.rawValue).font(.subheadline.weight(.semibold))
-                .frame(width: 53, alignment: .leading)
-            Text(description).font(.subheadline).foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-    }
-}
-
 private struct MenuBoardView: View {
     @ObservedObject var store: BoardStore
     let provider: QuotaProvider?
     let switchGemini: (QuotaCard) -> Void
-    let showGuide: () -> Void
+    let showSettings: (QuotaProvider?) -> Void
     let navigate: (QuotaProvider?) -> Void
 
     private var lastUpdate: Date? { store.lastRefresh ?? store.cards.compactMap { parseDate($0.updatedAt) }.max() }
@@ -770,15 +766,7 @@ private struct MenuBoardView: View {
             if let provider {
                 detail(provider)
             } else {
-                ViewThatFits(in: .horizontal) {
-                    overview(ringSize: 46)
-                    overview(ringSize: 36)
-                    overview(ringSize: 32)
-                    ScrollView(.horizontal) {
-                        overview(ringSize: 32)
-                    }
-                }.frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .padding(.horizontal, 10)
+                overview
             }
             footer
         }.frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -790,42 +778,53 @@ private struct MenuBoardView: View {
             }
     }
 
-    private func overview(ringSize: CGFloat) -> some View {
-        HStack(spacing: 7) {
-            ForEach(QuotaProvider.allCases, id: \.self) { provider in
-                if provider != .codex {
-                    Rectangle().fill(.primary.opacity(0.12)).frame(width: 1, height: 72)
+    private var overview: some View {
+        let providers = QuotaProvider.allCases.filter {
+            !store.hiddenProviders.contains($0.rawValue) && !cards(for: $0).isEmpty
+        }
+        return VStack(spacing: 5) {
+            HStack {
+                Text("额度总览").fontWeight(.semibold)
+                Spacer()
+                Text("最短周期 · 剩余额度").foregroundStyle(.secondary)
+            }.padding(.horizontal, 5)
+            if providers.isEmpty {
+                Spacer()
+                Button("在设置中选择显示的平台") { showSettings(nil) }
+                Spacer()
+            } else {
+                HStack(spacing: 5) {
+                    ForEach(Array(providers.enumerated()), id: \.element) { index, provider in
+                        if index > 0 {
+                            Divider().frame(height: 100)
+                        }
+                        let card = store.overviewCard(for: provider.rawValue)
+                        ProviderRings(provider: provider, card: card,
+                                      accountName: card.map(store.displayName(for:)), ringSize: 40) {
+                            navigate(provider)
+                        }
+                    }
                 }
-                let card = currentCard(for: provider)
-                ProviderRings(provider: provider, card: card,
-                              accountName: card.map(store.displayName(for:)), ringSize: ringSize) {
-                    navigate(provider)
-                }
+                .frame(maxHeight: .infinity)
             }
-        }.fixedSize(horizontal: true, vertical: false)
+            Divider()
+        }
+        .font(.system(size: 11)).padding(.horizontal, 12).padding(.top, 10)
     }
 
     private func cards(for provider: QuotaProvider) -> [QuotaCard] {
         store.cards.filter { $0.provider == provider.rawValue }
     }
 
-    private func currentCard(for provider: QuotaProvider) -> QuotaCard? {
-        let accounts = cards(for: provider)
-        if !provider.hasMultipleAccounts { return accounts.first }
-        if provider == .gemini {
-            return accounts.first { $0.id == store.activeAccounts["Gemini"] } ?? accounts.first
-        }
-        guard let id = store.activeAccounts[provider.rawValue] else { return nil }
-        return accounts.first { $0.id == id }
-    }
-
     private func detail(_ provider: QuotaProvider) -> some View {
         let accounts = cards(for: provider)
-        let activeID = currentCard(for: provider)?.id
+        let activeID = store.overviewCard(for: provider.rawValue)?.id
         return VStack(spacing: 6) {
             ZStack {
-                BrandMark(provider: provider, size: 23)
-                    .accessibilityHidden(false).accessibilityLabel(provider.accessibilityName)
+                HStack(spacing: 6) {
+                    BrandMark(provider: provider, size: 17)
+                    Text(provider.rawValue).font(.system(size: 11, weight: .semibold))
+                }
                 HStack {
                     Button { navigate(nil) } label: {
                         Image(systemName: "chevron.left").font(.system(size: 12, weight: .semibold))
@@ -834,8 +833,15 @@ private struct MenuBoardView: View {
                     }.buttonStyle(.plain)
                         .help("返回服务列表").accessibilityLabel("返回服务列表")
                     Spacer()
+                    Button { showSettings(provider) } label: {
+                        Image(systemName: "gearshape.fill")
+                            .font(.system(size: 12))
+                            .frame(width: 27, height: 27)
+                            .background(.primary.opacity(0.055), in: Circle())
+                    }.buttonStyle(.plain).help("设置").accessibilityLabel("设置")
                 }
             }.padding(.horizontal, 12).padding(.top, 10)
+            Divider().padding(.horizontal, 12)
             ScrollView {
                 TimelineView(.periodic(from: .now, by: 30)) { context in
                     VStack(spacing: 18) {
@@ -848,6 +854,9 @@ private struct MenuBoardView: View {
                                     AccountRings(provider: provider, card: card, title: store.displayName(for: card),
                                                  isActive: card.id == activeID, now: context.date,
                                                  open: card.geminiRoute == nil ? nil : { switchGemini(card) })
+                                        .padding(.vertical, 6)
+                                        .background(card.id == activeID ? provider.tint(for: .light).opacity(0.08) : .clear,
+                                                    in: RoundedRectangle(cornerRadius: 12))
                                 }
                             }
                         }
@@ -867,13 +876,12 @@ private struct MenuBoardView: View {
             else if let message = store.processMessage { Text(message).lineLimit(1) }
             else if !allReady && !store.refreshing { Text("待更新") }
             Spacer()
-            Button(action: showGuide) {
-                Image(systemName: "questionmark.circle")
-                    .font(.system(size: 12, weight: .medium))
-                    .frame(width: 26, height: 26)
-                    .contentShape(Circle())
-            }.buttonStyle(.plain)
-                .help("新手引导").accessibilityLabel("新手引导")
+            if provider == nil {
+                Button { showSettings(nil) } label: {
+                    Image(systemName: "gearshape").font(.system(size: 12))
+                        .frame(width: 26, height: 26)
+                }.buttonStyle(.plain).help("设置").accessibilityLabel("设置")
+            }
             Button(action: refresh) {
                 Group {
                     if store.refreshing {
@@ -884,7 +892,7 @@ private struct MenuBoardView: View {
                 }.frame(width: 26, height: 26).contentShape(Circle())
             }.buttonStyle(.plain).disabled(store.refreshing)
                 .keyboardShortcut("r").help("刷新").accessibilityLabel("刷新")
-        }.font(.system(size: 9, weight: .medium)).foregroundStyle(.secondary)
+        }.font(.system(size: 11)).foregroundStyle(.secondary)
             .padding(.horizontal, 13).padding(.bottom, 8)
             .help(status)
     }
@@ -892,7 +900,7 @@ private struct MenuBoardView: View {
     private func refresh() {
         store.updateActiveAccounts()
         if let provider, provider == .cursor || provider == .gemini,
-           cards(for: provider).first?.errorCode == "keychain_required" {
+           cards(for: provider).contains(where: { $0.errorCode == "keychain_required" }) {
             store.refresh(account: provider == .gemini ? "gemini" : "cursor", interactive: true)
         } else {
             store.refresh()
@@ -962,10 +970,10 @@ private final class FrostedBackdrop: NSVisualEffectView {
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
-    private static let guideSeenKey = "HasSeenGettingStarted"
     private var statusItem: NSStatusItem!
     private var panel: QuotaPanel?
-    private var guideWindow: NSWindow?
+    private var setupWindow: NSWindow?
+    private var settingsWindow: NSWindow?
     private var store: BoardStore!
     private var switchingGemini = false
     private var geminiVerification: Task<Void, Never>?
@@ -998,44 +1006,71 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             guard let self else { return }
             if self.openingGeminiFromShortcut {
                 self.store.startRefreshing()
-            } else if self.panel == nil && self.guideWindow == nil {
+            } else if self.panel == nil && self.setupWindow == nil && self.settingsWindow == nil {
                 self.openInitialView()
             }
         }
     }
 
     private func openInitialView() {
-        if guideWindow != nil || !UserDefaults.standard.bool(forKey: Self.guideSeenKey) {
-            showGuide()
+        if setupWindow != nil || !store.isConfigured {
+            showSetup()
+        } else if let settingsWindow {
+            NSApp.activate(ignoringOtherApps: true)
+            settingsWindow.makeKeyAndOrderFront(nil)
         } else {
             store.startRefreshing()
             showPanel()
         }
     }
 
-    private func showGuide() {
+    private func showSetup(provider: QuotaProvider? = nil) {
         hidePanel()
-        if let guideWindow {
+        if let setupWindow {
             NSApp.activate(ignoringOtherApps: true)
-            guideWindow.makeKeyAndOrderFront(nil)
+            setupWindow.makeKeyAndOrderFront(nil)
             return
         }
-        let guide = GettingStartedView(
-            skip: { [weak self] in self?.guideWindow?.close() },
-            finish: { [weak self] in self?.guideWindow?.close() }
-        )
+        let setup = AccountSetupView(store: store, initialProvider: provider, firstRun: !store.isConfigured,
+                                     cancel: { [weak self] in self?.setupWindow?.close() }) { [weak self] selected in
+            guard let self else { return }
+            self.store.saveImports(selected)
+            self.setupWindow?.close()
+        }
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 500, height: 430),
+            contentRect: NSRect(x: 0, y: 0, width: 556, height: 478),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
         )
-        window.title = "额度看板 · 新手引导"
+        window.title = "额度看板 · 导入账号"
         window.isReleasedWhenClosed = false
         window.delegate = self
-        window.contentView = NSHostingView(rootView: guide)
+        window.contentView = NSHostingView(rootView: setup)
         window.center()
-        guideWindow = window
+        setupWindow = window
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+    }
+
+    private func showSettings(_ provider: QuotaProvider?) {
+        hidePanel()
+        if let settingsWindow {
+            settingsWindow.makeKeyAndOrderFront(nil)
+            return
+        }
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 700, height: 432),
+                              styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
+        window.title = "额度看板 · 设置"
+        window.isReleasedWhenClosed = false
+        window.delegate = self
+        window.contentView = NSHostingView(rootView: BoardSettingsView(
+            store: store, provider: provider ?? .codex,
+            addAccounts: { [weak self] in self?.showSetup(provider: $0) },
+            switchGemini: { [weak self] in self?.switchGeminiDesktop($0) }
+        ))
+        window.center()
+        settingsWindow = window
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
     }
@@ -1054,9 +1089,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             let windows = accounts.map { $0.windows.count }.max() ?? 0
             let additionalRows = min(2, max(0, (windows - 1) / 2))
             let accountRows = max(0, (accounts.count - 1) / 3)
-            height = (provider == .kiro ? 218 : 206) + CGFloat(additionalRows) * 96 + CGFloat(accountRows) * 135
+            height = 249 + CGFloat(additionalRows) * 104 + CGFloat(accountRows) * 152
         } else {
-            height = 139
+            height = 187
         }
         let panelHeight = min(height, visible.height)
         let anchor = anchorWindow.convertToScreen(button.convert(button.bounds, to: nil))
@@ -1097,7 +1132,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             store: store,
             provider: provider,
             switchGemini: { [weak self] in self?.switchGeminiDesktop($0) },
-            showGuide: { [weak self] in self?.showGuide() },
+            showSettings: { [weak self] in self?.showSettings($0) },
             navigate: { [weak self] page in self?.navigate(to: page) }
         ))
         host.sizingOptions = []
@@ -1258,10 +1293,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func windowWillClose(_ notification: Notification) {
-        guard let window = notification.object as? NSWindow, window === guideWindow else { return }
-        guideWindow = nil
-        UserDefaults.standard.set(true, forKey: Self.guideSeenKey)
-        DispatchQueue.main.async { [weak self] in self?.openInitialView() }
+        guard let window = notification.object as? NSWindow else { return }
+        if window === setupWindow {
+            setupWindow = nil
+            if store.isConfigured { DispatchQueue.main.async { [weak self] in self?.openInitialView() } }
+        } else if window === settingsWindow {
+            settingsWindow = nil
+            DispatchQueue.main.async { [weak self] in self?.openInitialView() }
+        }
     }
 
     func windowDidResignKey(_ notification: Notification) {
