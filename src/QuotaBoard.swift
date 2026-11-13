@@ -111,6 +111,7 @@ final class BoardStore: ObservableObject {
     @Published var renamingAccount: QuotaCard?
     @Published private(set) var switchingAccount = false
     @Published var switchMessage: String?
+    @Published var switchConfirmation: QuotaCard?
     private var process: Process?
     private var timer: Timer?
     private var activeLookupGeneration = 0
@@ -166,9 +167,20 @@ final class BoardStore: ObservableObject {
         UserDefaults.standard.set(hiddenProviders.sorted(), forKey: "HiddenQuotaProviders")
     }
 
+    var visibleOverviewProviders: [QuotaProvider] {
+        let importedProviders = Set(cards.map(\.provider))
+        return QuotaProvider.allCases.filter {
+            importedProviders.contains($0.rawValue) && !hiddenProviders.contains($0.rawValue)
+        }
+    }
+
     func overviewCard(for provider: String) -> QuotaCard? {
         let candidates = cards.filter { $0.provider == provider }
         return candidates.first { $0.id == activeAccounts[provider] } ?? candidates.first
+    }
+
+    func canSwitch(to card: QuotaCard) -> Bool {
+        card.identityKey != nil && activeAccounts[card.provider] != card.id
     }
 
     func discover(_ providers: [QuotaProvider], completion: @escaping ([ImportAccount], String?) -> Void) {
@@ -604,6 +616,16 @@ enum QuotaProvider: String, CaseIterable, Identifiable {
         }
     }
 
+    var switchInstructions: String {
+        switch self {
+        case .codex: return "Codex 会退出并重新打开。"
+        case .kiro: return "将在终端打开此账号的 Kiro CLI 会话。"
+        case .cursor: return "将打开此账号对应的 Cursor 窗口。"
+        case .claude: return "将在终端打开此账号的 Claude Code 会话。"
+        case .copilot: return "将此账号设为 GitHub CLI 的当前账号。"
+        }
+    }
+
     func shortestWindow(for card: QuotaCard?) -> QuotaWindow? {
         return card?.windows.min { left, right in
             left.durationForDisplay < right.durationForDisplay
@@ -699,7 +721,7 @@ private struct ProviderRings: View {
 
     var body: some View {
         Button(action: select) {
-            VStack(spacing: 5) {
+            VStack(spacing: 8) {
                 HStack(spacing: 4) {
                     BrandMark(provider: provider, size: 15)
                     Text(provider.displayTitle).font(.system(size: 11, weight: .semibold))
@@ -709,7 +731,7 @@ private struct ProviderRings: View {
                 overviewRing(provider.shortestWindow(for: card))
             }
             .frame(maxWidth: .infinity)
-            .padding(.horizontal, 6).padding(.vertical, 7)
+            .padding(.horizontal, 8).padding(.vertical, 10)
             .background(.primary.opacity(hovered ? 0.065 : 0), in: RoundedRectangle(cornerRadius: 13))
             .contentShape(RoundedRectangle(cornerRadius: 13))
         }
@@ -722,7 +744,7 @@ private struct ProviderRings: View {
 
     private func overviewRing(_ window: QuotaWindow?) -> some View {
         let title = window?.englishTitle
-        return VStack(spacing: 4) {
+        return VStack(spacing: 7) {
             QuotaRing(remaining: window?.remaining, tint: provider.tint(for: scheme),
                       size: ringSize, cached: window != nil && card?.status != "ok")
             Text(title ?? "暂无额度")
@@ -739,8 +761,12 @@ private struct AccountRings: View {
     let card: QuotaCard
     let title: String
     let isActive: Bool
+    let canSwitch: Bool
+    let requestSwitch: () -> Void
+    let reservesDetailLine: Bool
     let now: Date
     @Environment(\.colorScheme) private var scheme
+    @State private var hovered = false
 
     private var accountTitle: some View {
         HStack(spacing: 5) {
@@ -755,14 +781,13 @@ private struct AccountRings: View {
 
     var body: some View {
         VStack(spacing: 8) {
-            accountTitle.help(title)
-            if !card.email.isEmpty && card.email != title {
+            VStack(spacing: 4) {
+                accountTitle.help(canSwitch ? "\(title) · 双击切换账号" : title)
                 Text(card.email).font(.system(size: 11)).foregroundStyle(.secondary)
                     .lineLimit(1).truncationMode(.middle).help(card.email)
-            }
-
-            if isActive {
-                Text("总览账号").font(.system(size: 11)).foregroundStyle(.secondary)
+                    .frame(height: 15)
+                    .opacity(card.email == title ? 0 : 1)
+                    .accessibilityHidden(card.email.isEmpty || card.email == title)
             }
             if card.windows.isEmpty {
                 Text(card.errorCode == "keychain_required" ? "点刷新以授权读取" : card.message ?? "等待读取")
@@ -779,7 +804,15 @@ private struct AccountRings: View {
                 }
             }
         }.frame(maxWidth: .infinity, alignment: .top)
+            .padding(.vertical, 6)
+            .background(.primary.opacity(hovered && canSwitch ? 0.055 : 0),
+                        in: RoundedRectangle(cornerRadius: 12))
             .background(AccountHitRegion(accountID: card.id).accessibilityHidden(true))
+            .contentShape(Rectangle())
+            .simultaneousGesture(TapGesture(count: 2).onEnded {
+                if canSwitch { requestSwitch() }
+            })
+            .onHover { hovered = $0 }
     }
 
     private func metric(_ window: QuotaWindow) -> some View {
@@ -790,14 +823,15 @@ private struct AccountRings: View {
             QuotaRing(remaining: window.remaining, tint: provider.tint(for: scheme), size: 54,
                       cached: card.status != "ok")
             Text(window.englishTitle).font(.system(size: 11, weight: .medium))
-                .lineLimit(1).minimumScaleFactor(0.8)
-            if let detail = window.detail, !detail.isEmpty {
-                Text(detail).font(.system(size: 11, weight: .medium))
+                .lineLimit(1).minimumScaleFactor(0.8).frame(height: 15)
+            if reservesDetailLine {
+                Text(window.detail ?? "").font(.system(size: 11, weight: .medium))
                     .lineLimit(1).minimumScaleFactor(0.8)
+                    .frame(height: 15)
             }
-            if window.resetsAt != nil {
-                Text(resetShort).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
-            }
+            Text(window.resetsAt == nil ? "" : resetShort)
+                .font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
+                .frame(height: 15)
         }.accessibilityElement(children: .ignore)
             .accessibilityLabel("\(window.englishTitle)，剩余 \(QuotaRing.percentage(window.remaining))，\(window.detail.map { $0 + "，" } ?? "")\(reset)\(card.status == "ok" ? "" : "，上次结果")")
             .help("\(reset)\(card.status == "ok" ? "" : " · 上次结果")")
@@ -846,10 +880,14 @@ private struct MenuBoardView: View {
     let provider: QuotaProvider?
     let showSettings: (QuotaProvider?) -> Void
     let navigate: (QuotaProvider?) -> Void
+    let requestSwitch: (QuotaCard) -> Void
+    let confirmSwitch: (QuotaCard) -> Void
 
     private var lastUpdate: Date? { store.lastRefresh ?? store.cards.compactMap { parseDate($0.updatedAt) }.max() }
     private var allReady: Bool { store.readyCount == store.cards.count }
     private var status: String {
+        if store.switchingAccount { return "正在切换账号…" }
+        if let message = store.switchMessage { return message }
         if store.refreshing { return "正在更新" }
         if let message = store.processMessage { return message }
         return allReady ? "全部已更新" : "部分账号待更新"
@@ -864,8 +902,13 @@ private struct MenuBoardView: View {
             }
             footer
         }.frame(maxWidth: .infinity, maxHeight: .infinity)
+            .disabled(store.switchConfirmation != nil)
+            .accessibilityHidden(store.switchConfirmation != nil)
             .overlay {
-                if let card = store.renamingAccount {
+                if let card = store.switchConfirmation {
+                    Color.black.opacity(0.28).accessibilityHidden(true)
+                    switchPrompt(card)
+                } else if let card = store.renamingAccount {
                     Color.black.opacity(0.16)
                     RenameAccountView(store: store, card: card).id(card.id)
                 }
@@ -873,24 +916,21 @@ private struct MenuBoardView: View {
     }
 
     private var overview: some View {
-        let providers = QuotaProvider.allCases.filter {
-            !store.hiddenProviders.contains($0.rawValue) && !cards(for: $0).isEmpty
-        }
-        return VStack(spacing: 5) {
+        let providers = store.visibleOverviewProviders
+        return VStack(spacing: 9) {
             HStack {
                 Text("额度总览").fontWeight(.semibold)
                 Spacer()
-                Text("最短周期 · 剩余额度").foregroundStyle(.secondary)
-            }.padding(.horizontal, 5)
+            }.padding(.horizontal, 3)
             if providers.isEmpty {
                 Spacer()
                 Button("在设置中选择显示的平台") { showSettings(nil) }
                 Spacer()
             } else {
-                HStack(spacing: 5) {
+                HStack(spacing: 9) {
                     ForEach(Array(providers.enumerated()), id: \.element) { index, provider in
                         if index > 0 {
-                            Divider().frame(height: 100)
+                            Divider().frame(height: 108)
                         }
                         let card = store.overviewCard(for: provider.rawValue)
                         ProviderRings(provider: provider, card: card,
@@ -903,7 +943,35 @@ private struct MenuBoardView: View {
             }
             Divider()
         }
-        .font(.system(size: 11)).padding(.horizontal, 12).padding(.top, 10)
+        .font(.system(size: 11)).padding(.horizontal, 18).padding(.top, 15)
+    }
+
+    private func switchPrompt(_ card: QuotaCard) -> some View {
+        let name = store.displayName(for: card)
+        let target = card.email.isEmpty || card.email == name ? name : "\(name)（\(card.email)）"
+        return VStack(alignment: .leading, spacing: 10) {
+            Text("切换 \(card.provider) 账号？")
+                .font(.headline).accessibilityAddTraits(.isHeader)
+            Text("将切换到 \(target)。")
+                .font(.callout)
+                .fixedSize(horizontal: false, vertical: true)
+            if let provider = QuotaProvider(rawValue: card.provider) {
+                Text(provider.switchInstructions)
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            HStack {
+                Spacer()
+                Button("取消") { store.switchConfirmation = nil }
+                    .keyboardShortcut(.cancelAction)
+                Button("确认切换") { confirmSwitch(card) }
+                    .buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(16)
+        .frame(maxWidth: 350)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
+        .padding(12)
     }
 
     private func cards(for provider: QuotaProvider) -> [QuotaCard] {
@@ -913,6 +981,9 @@ private struct MenuBoardView: View {
     private func detail(_ provider: QuotaProvider) -> some View {
         let accounts = cards(for: provider)
         let activeID = store.overviewCard(for: provider.rawValue)?.id
+        let reservesDetailLine = accounts.contains { account in
+            account.windows.contains { $0.detail?.isEmpty == false }
+        }
         return VStack(spacing: 6) {
             ZStack {
                 HStack(spacing: 6) {
@@ -946,8 +1017,11 @@ private struct MenuBoardView: View {
                                         Rectangle().fill(.primary.opacity(0.10)).frame(width: 1, height: 112)
                                     }
                                     AccountRings(provider: provider, card: card, title: store.displayName(for: card),
-                                                 isActive: card.id == activeID, now: context.date)
-                                        .padding(.vertical, 6)
+                                                 isActive: card.id == activeID,
+                                                 canSwitch: store.canSwitch(to: card),
+                                                 requestSwitch: { requestSwitch(card) },
+                                                 reservesDetailLine: reservesDetailLine,
+                                                 now: context.date)
                                         .background(card.id == activeID ? provider.tint(for: .light).opacity(0.08) : .clear,
                                                     in: RoundedRectangle(cornerRadius: 12))
                                 }
@@ -965,7 +1039,8 @@ private struct MenuBoardView: View {
             if let lastUpdate {
                 Text(lastUpdate, style: .time).monospacedDigit()
             }
-            if let message = store.processMessage { Text(message).lineLimit(1) }
+            if store.switchingAccount { Text("正在切换账号…") }
+            else if let message = store.switchMessage ?? store.processMessage { Text(message).lineLimit(1).help(message) }
             else if !allReady && !store.refreshing { Text("待更新") }
             Spacer()
             if provider == nil {
@@ -985,7 +1060,7 @@ private struct MenuBoardView: View {
             }.buttonStyle(.plain).disabled(store.refreshing)
                 .keyboardShortcut("r").help("刷新").accessibilityLabel("刷新")
         }.font(.system(size: 11)).foregroundStyle(.secondary)
-            .padding(.horizontal, 13).padding(.bottom, 8)
+            .padding(.horizontal, provider == nil ? 19 : 13).padding(.bottom, provider == nil ? 11 : 8)
             .help(status)
     }
 
@@ -1093,6 +1168,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         Task { @MainActor [weak self] in await self?.store.switchLogin(card) }
     }
 
+    private func requestAccountSwitch(_ id: String, for provider: QuotaProvider) -> Bool {
+        guard store.renamingAccount == nil, store.switchConfirmation == nil, !store.switchingAccount,
+              let card = store.cards.first(where: { $0.id == id && $0.provider == provider.rawValue }),
+              store.canSwitch(to: card) else { return false }
+        store.switchConfirmation = card
+        return true
+    }
+
     private func showSetup(provider: QuotaProvider? = nil) {
         hidePanel()
         if let setupWindow {
@@ -1150,7 +1233,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let visible = screen.visibleFrame.insetBy(dx: 8, dy: 5)
         let width: CGFloat
         if let provider { width = store.cards.filter { $0.provider == provider.rawValue }.count > 1 ? 510 : 300 }
-        else { width = 490 }
+        else {
+            let count = store.visibleOverviewProviders.count
+            width = count == 0 ? 248 : max(196, 36 + CGFloat(count) * 128)
+        }
         let panelWidth = min(width, visible.width)
         let height: CGFloat
         if let provider {
@@ -1160,7 +1246,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             let accountRows = max(0, (accounts.count - 1) / 3)
             height = 270 + CGFloat(additionalRows + accountRows) * 104 + CGFloat(accountRows) * 55
         } else {
-            height = 187
+            height = 215
         }
         let panelHeight = min(height, visible.height)
         let anchor = anchorWindow.convertToScreen(button.convert(button.bounds, to: nil))
@@ -1175,7 +1261,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         next.title = "额度看板"
         next.isOpaque = false
         next.backgroundColor = .clear
-        next.hasShadow = true
+        next.hasShadow = false
         next.isFloatingPanel = true
         next.level = .popUpMenu
         next.hidesOnDeactivate = true
@@ -1185,12 +1271,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         next.delegate = self
         next.dismiss = { [weak self] in
             guard let self else { return }
-            if self.store.renamingAccount != nil { self.store.renamingAccount = nil }
+            if self.store.switchConfirmation != nil { self.store.switchConfirmation = nil }
+            else if self.store.renamingAccount != nil { self.store.renamingAccount = nil }
             else { self.hidePanel() }
         }
         if let provider {
             next.detailMenu = { [weak self] accountID in
-                guard let self, self.store.renamingAccount == nil else { return nil }
+                guard let self, self.store.renamingAccount == nil, self.store.switchConfirmation == nil else { return nil }
                 return self.detailMenu(for: provider, accountID: accountID)
             }
         }
@@ -1203,7 +1290,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             store: store,
             provider: provider,
             showSettings: { [weak self] in self?.showSettings($0) },
-            navigate: { [weak self] page in self?.navigate(to: page) }
+            navigate: { [weak self] page in self?.navigate(to: page) },
+            requestSwitch: { [weak self] card in
+                guard let provider else { return }
+                _ = self?.requestAccountSwitch(card.id, for: provider)
+            },
+            confirmSwitch: { [weak self] card in
+                self?.store.switchConfirmation = nil
+                self?.switchAccount(card)
+            }
         ))
         host.sizingOptions = []
         host.frame = bounds
@@ -1232,6 +1327,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             return item
         }
         if let clicked {
+            if store.canSwitch(to: clicked) {
+                menu.addItem(makeItem("切换到此账号…", action: #selector(confirmDetailAccountSwitch(_:)),
+                                      value: clicked.id, symbol: "arrow.left.arrow.right"))
+            }
             menu.addItem(makeItem("修改显示名称…", action: #selector(renameDetailAccount(_:)),
                                   value: clicked.id, symbol: "pencil"))
         } else if !accounts.isEmpty {
@@ -1263,6 +1362,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         store.renamingAccount = account(from: item)
     }
 
+    @objc private func confirmDetailAccountSwitch(_ item: NSMenuItem) {
+        guard let card = account(from: item), let provider = QuotaProvider(rawValue: card.provider) else { return }
+        _ = requestAccountSwitch(card.id, for: provider)
+    }
+
     @objc private func openDetailLink(_ item: NSMenuItem) {
         if let url = item.representedObject as? URL { NSWorkspace.shared.open(url) }
     }
@@ -1289,6 +1393,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         guard let panel else { return }
         self.panel = nil
         store.renamingAccount = nil
+        store.switchConfirmation = nil
         panel.delegate = nil
         panel.orderOut(nil)
         panel.close()

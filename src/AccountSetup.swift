@@ -270,6 +270,8 @@ struct BoardSettingsView: View {
     let switchAccount: (QuotaCard) -> Void
 
     var body: some View {
+        let accounts = store.cards.filter { $0.provider == provider.rawValue }
+        let hasAccounts = !accounts.isEmpty
         HStack(spacing: 0) {
             VStack(alignment: .leading, spacing: 3) {
                 Text("平台").font(.subheadline.weight(.medium)).foregroundStyle(.secondary)
@@ -300,14 +302,18 @@ struct BoardSettingsView: View {
                 HStack {
                     VStack(alignment: .leading, spacing: 3) {
                         Text("在总览中显示").fontWeight(.medium)
-                        Text("显示当前账号的最短周期额度").font(.subheadline).foregroundStyle(.secondary)
+                        Text(hasAccounts ? "显示当前账号的最短周期额度" : "导入账号后即可开启")
+                            .font(.subheadline).foregroundStyle(.secondary)
                     }
                     Spacer()
                     Toggle("在总览中显示", isOn: Binding(
-                        get: { !store.hiddenProviders.contains(provider.rawValue) },
-                        set: { store.setVisible($0, provider: provider.rawValue) }
+                        get: { hasAccounts && !store.hiddenProviders.contains(provider.rawValue) },
+                        set: { visible in
+                            if hasAccounts { store.setVisible(visible, provider: provider.rawValue) }
+                        }
                     )).labelsHidden().toggleStyle(.switch).controlSize(.mini)
                 }
+                .disabled(!hasAccounts)
                 .padding(11).background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 9))
                 HStack {
                     Text("登录账号").fontWeight(.semibold)
@@ -317,8 +323,7 @@ struct BoardSettingsView: View {
                 if let message = store.switchMessage {
                     Text(message).font(.callout).foregroundStyle(.secondary)
                 }
-                let accounts = store.cards.filter { $0.provider == provider.rawValue }
-                if accounts.isEmpty {
+                if !hasAccounts {
                     Text("还没有导入账号。").foregroundStyle(.secondary)
                 } else {
                     ScrollView {
@@ -365,8 +370,17 @@ struct BoardSettingsView: View {
                     .controlSize(.small).disabled(store.switchingAccount)
                     .help(provider == .copilot ? "切换 GitHub CLI 登录" : "切换 \(provider.displayTitle) 登录")
             }
-            Button { editing = account } label: { Image(systemName: "pencil").frame(width: 24, height: 24) }
-                .buttonStyle(.plain).help("编辑账号").accessibilityLabel("编辑 \(store.displayName(for: account))")
+            Button {
+                editing = account
+            } label: {
+                Label("编辑", systemImage: "pencil")
+                    .labelStyle(.titleAndIcon)
+                    .fixedSize()
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .help("编辑账号")
+            .accessibilityLabel("编辑 \(store.displayName(for: account))")
         }.padding(.horizontal, 10).padding(.vertical, 8)
     }
 }
