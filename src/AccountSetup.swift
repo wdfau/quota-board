@@ -351,8 +351,10 @@ struct BoardSettingsView: View {
                         }
                     } label: {
                         Label("应用操作", systemImage: "power")
+                            .labelStyle(.iconOnly)
                     }
                     .menuStyle(.borderedButton)
+                    .menuIndicator(.hidden)
                     .fixedSize()
                 }
             }
