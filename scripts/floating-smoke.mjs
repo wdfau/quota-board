@@ -32,6 +32,7 @@ try {
     has: panel.getByText(label, { exact: true }),
   });
   const back = panel.getByRole("button", { name: "返回服务列表" });
+  await expect(panel.getByRole("button", { name: /^Codex · / })).toContainText("62%");
   await openService(/^Codex · /);
   await expect(panel.locator(".account-card")).toHaveCount(2);
   await accountCard("工作号").getByRole("button", { name: /5 小时/ }).click();
@@ -46,6 +47,7 @@ try {
   await openService(/^Codex · /);
   await accountCard("工作号").getByRole("button", { name: /每周/ }).click();
   await expect(ball.locator("#orb-value")).toHaveText("38%");
+  await back.click();
   await mkdir("artifacts", { recursive: true });
   await ball.screenshot({
     path: "artifacts/floating-ball.png",

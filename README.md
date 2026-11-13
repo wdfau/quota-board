@@ -4,7 +4,9 @@
 
 面向 Windows 与 macOS 的 Electron 桌面应用，首批目标服务为 Codex、Claude、Cursor 和 GitHub Copilot，范围为账号订阅；Gemini 和按量付费的 API 余额不在范围内。当前原型包含四类服务的接入入口，各自能力见下表。Windows 默认以可拖动的悬浮球常驻，点击后展开账号面板，外圈表示所选账号与周期的已用比例。提供账号管理、5 分钟自动刷新和独立的虚拟数据演示。
 
-![Windows 悬浮球交互原型，虚拟数据](docs/windows-floating.png)
+![悬浮球显示已用额度，虚拟数据](docs/windows-floating-ball.png)
+
+![展开面板显示各服务剩余额度，虚拟数据](docs/windows-floating.png)
 
 截图来自 macOS 上运行的实际交互原型。Windows 实机的透明窗口、高 DPI 和多屏拖动效果仍待验证。
 
@@ -37,7 +39,7 @@ Codex 已在开发用 Mac 上通过一次真实官方 CLI 查询，核对账号�
 需要 Node.js 24 LTS、npm 和 Git。
 
 ```sh
-git clone https://github.com/wdfau/quota-board.git
+git clone --branch cross-platform https://github.com/wdfau/quota-board.git
 cd quota-board
 npm ci
 npm start
