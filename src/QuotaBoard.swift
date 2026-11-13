@@ -538,7 +538,10 @@ final class BoardStore: ObservableObject {
         }
     }
 
-    func stop() { process?.terminate() }
+    func stop() {
+        timer?.invalidate()
+        if let process, process.isRunning { process.terminate() }
+    }
 }
 
 func parseDate(_ value: String?) -> Date? {
@@ -1120,8 +1123,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var setupWindow: NSWindow?
     private var settingsWindow: NSWindow?
     private var store: BoardStore!
+    private var restarting = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        let arguments = CommandLine.arguments
+        if let index = arguments.firstIndex(of: "--relaunch-after"),
+           let pid = arguments.dropFirst(index + 1).first.flatMap(pid_t.init),
+           pid > 0, pid != ProcessInfo.processInfo.processIdentifier {
+            waitForPreviousInstance(pid, remainingAttempts: 100)
+        } else {
+            startBoard()
+        }
+    }
+
+    private func waitForPreviousInstance(_ pid: pid_t, remainingAttempts: Int) {
+        guard let previous = NSRunningApplication(processIdentifier: pid),
+              previous.bundleIdentifier == Bundle.main.bundleIdentifier,
+              !previous.isTerminated else {
+            startBoard()
+            return
+        }
+        guard remainingAttempts > 0 else {
+            NSApp.terminate(nil)
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            self?.waitForPreviousInstance(pid, remainingAttempts: remainingAttempts - 1)
+        }
+    }
+
+    private func startBoard() {
         store = BoardStore()
 
         let image = NSImage(systemSymbolName: "chart.bar.fill", accessibilityDescription: "额度看板")
@@ -1219,12 +1250,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         window.contentView = NSHostingView(rootView: BoardSettingsView(
             store: store, provider: provider ?? .codex,
             addAccounts: { [weak self] in self?.showSetup(provider: $0) },
-            switchAccount: { [weak self] in self?.switchAccount($0) }
+            switchAccount: { [weak self] in self?.switchAccount($0) },
+            restartApp: { [weak self] in self?.restartApp() },
+            quitApp: { NSApp.terminate(nil) }
         ))
         window.center()
         settingsWindow = window
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
+    }
+
+    private func restartApp() {
+        guard !restarting else { return }
+        restarting = true
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.createsNewApplicationInstance = true
+        configuration.activates = false
+        configuration.arguments = ["--relaunch-after", String(ProcessInfo.processInfo.processIdentifier)]
+        NSWorkspace.shared.openApplication(at: Bundle.main.bundleURL, configuration: configuration) { app, error in
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                if error == nil, app != nil {
+                    NSApp.terminate(nil)
+                } else {
+                    self.restarting = false
+                    let alert = NSAlert()
+                    alert.messageText = "无法重新启动额度看板"
+                    alert.informativeText = "请稍后重试。"
+                    alert.addButton(withTitle: "好")
+                    if let window = self.settingsWindow { alert.beginSheetModal(for: window) }
+                    else { alert.runModal() }
+                }
+            }
+        }
     }
 
     private func frame(for provider: QuotaProvider?) -> NSRect? {
@@ -1419,11 +1477,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     func applicationDidChangeScreenParameters(_ notification: Notification) { hidePanel() }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        openInitialView()
+        if store != nil { openInitialView() }
         return true
     }
 
-    func applicationWillTerminate(_ notification: Notification) { store.stop() }
+    func applicationWillTerminate(_ notification: Notification) { store?.stop() }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 }
 

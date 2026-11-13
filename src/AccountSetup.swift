@@ -268,6 +268,8 @@ struct BoardSettingsView: View {
     @State private var editing: QuotaCard?
     let addAccounts: (QuotaProvider) -> Void
     let switchAccount: (QuotaCard) -> Void
+    let restartApp: () -> Void
+    let quitApp: () -> Void
 
     var body: some View {
         let accounts = store.cards.filter { $0.provider == provider.rawValue }
@@ -337,6 +339,22 @@ struct BoardSettingsView: View {
                     }
                 }
                 Spacer(minLength: 0)
+                Divider()
+                HStack {
+                    Spacer()
+                    Menu {
+                        Button(action: restartApp) {
+                            Label("重新启动", systemImage: "arrow.clockwise")
+                        }
+                        Button(action: quitApp) {
+                            Label("退出额度看板", systemImage: "power")
+                        }
+                    } label: {
+                        Label("应用操作", systemImage: "power")
+                    }
+                    .menuStyle(.borderedButton)
+                    .fixedSize()
+                }
             }
             .padding(20)
         }
