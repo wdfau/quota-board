@@ -1,0 +1,53 @@
+name: Quota Board for Windows
+on:
+  push:
+    paths:
+      - "windows/**"
+      - ".github/workflows/windows.yml"
+  pull_request:
+    paths:
+      - "windows/**"
+      - ".github/workflows/windows.yml"
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: windows
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: windows/package-lock.json
+      - run: npm ci
+      - run: npm test
+      - run: npm run test:ui
+      - run: npm run dist
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+          GH_TOKEN: ${{ github.token }}
+      - name: Verify portable archive
+        shell: pwsh
+        run: |
+          $zip = Get-Item release/QuotaBoard-windows-x64-*.zip
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $archive = [IO.Compression.ZipFile]::OpenRead($zip.FullName)
+          try {
+            if (!($archive.Entries.Name -contains 'Quota Board.exe') -or !($archive.Entries.Name -contains 'app.asar')) {
+              throw 'Portable archive is missing the app executable or ASAR.'
+            }
+          } finally { $archive.Dispose() }
+          $hash = (Get-FileHash $zip.FullName).Hash.ToLowerInvariant()
+          "$hash  $($zip.Name)" | Set-Content release/SHA256SUMS-windows.txt -Encoding ascii
+      - uses: actions/upload-artifact@v4
+        with:
+          name: quota-board-windows-x64
+          path: |
+            windows/release/QuotaBoard-windows-x64-*.zip
+            windows/release/SHA256SUMS-windows.txt
+          if-no-files-found: error

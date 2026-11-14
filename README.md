@@ -2,9 +2,12 @@
 
 额度看板住在 Mac 右上角的菜单栏里。打开后可以查看各服务当前账号的剩余额度，点进某个服务再看它的所有账号、额度周期和重置时间。
 
-当前版本是 SwiftUI 和 AppKit 实现的 macOS 菜单栏应用，适用于 **Apple Silicon、macOS 26.0 或更新版本**。Windows 版仍在开发中。
+当前版本是 SwiftUI 和 AppKit 实现的 macOS 菜单栏应用，适用于 **Apple Silicon、macOS 26.0 或更新版本**。Windows 预览版采用 Material 3，沿用 Mac 版的页面层级。
 
 ## 下载和打开
+
+- **Windows x64** 见 [Windows 预览版及平台支持说明](windows/README.md)。
+- **macOS** 按下文步骤操作。
 
 从 [GitHub Releases](https://github.com/wdfau/quota-board/releases) 下载 Mac 版压缩包，解压并打开「额度看板.app」。应用需要系统的 `/usr/bin/python3` 来读取用量。预发布包使用本地签名，尚未经过 Apple 公证。
 
