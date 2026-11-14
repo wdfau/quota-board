@@ -145,22 +145,29 @@ export async function queryCopilot(profile, identityOnly = false) {
   }
 }
 
-export async function queryClaude(profile, identityOnly = false) {
-  const status = await new Promise((resolve, reject) => {
-    const child = spawn("claude", ["auth", "status"], { windowsHide: true, stdio: ["ignore", "pipe", "ignore"] });
+function cliOutput(command, args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { windowsHide: true, stdio: ["ignore", "pipe", "ignore"] });
     let output = "";
     const timer = setTimeout(() => child.kill(), 8000);
-    child.on("error", reject);
+    child.on("error", () => {
+      clearTimeout(timer);
+      reject(new Error(`无法启动 ${command}，请检查安装及 PATH`));
+    });
     child.stdout.on("data", (chunk) => {
       output += chunk;
       if (output.length > 65536) child.kill();
     });
     child.on("close", (code) => {
       clearTimeout(timer);
-      if (code !== 0) return reject(new Error("请先通过 Claude Code 登录"));
-      try { resolve(JSON.parse(output)); } catch { reject(new Error("无法读取 Claude 登录身份")); }
+      if (code === 0) resolve(output);
+      else reject(new Error(`无法读取 ${command} 登录状态`));
     });
   });
+}
+
+export async function queryClaude(profile, identityOnly = false) {
+  const status = JSON.parse(await cliOutput("claude", ["auth", "status"]));
   if (!status.loggedIn || !status.email) throw new Error("请先通过 Claude Code 登录");
   const identity = { identityKey: status.email.toLowerCase(), email: status.email, label: status.email.split("@")[0], source: "Claude Code" };
   if (identityOnly || !profile.snapshotPath) return identity;
@@ -169,4 +176,11 @@ export async function queryClaude(profile, identityOnly = false) {
   return { ...validateSnapshot(JSON.parse(raw)), ...identity };
 }
 
-export const queries = { codex: queryCodex, copilot: queryCopilot, claude: queryClaude };
+export async function queryKiro() {
+  const status = await cliOutput("kiro-cli", ["whoami"]);
+  const address = status.match(/^\s*Email:\s*([^\s]+@[^\s]+)\s*$/im)?.[1];
+  if (!address) throw new Error("Kiro CLI 未返回可核对的邮箱");
+  return { identityKey: address.toLowerCase(), email: address, label: address.split("@")[0], source: "Kiro CLI", mode: "manual", windows: [] };
+}
+
+export const queries = { codex: queryCodex, copilot: queryCopilot, claude: queryClaude, kiro: queryKiro };

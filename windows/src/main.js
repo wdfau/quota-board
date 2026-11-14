@@ -102,7 +102,7 @@ async function candidates(providers) {
     }
     for (let offset = 0; offset < roots.length; offset += 3) {
       const found = await Promise.allSettled(roots.slice(offset, offset + 3).map(async (home) => ({
-        ...(await query({ home }, true)), home, provider, mode: "cli", windows: [],
+        home, provider, mode: "cli", windows: [], ...(await query({ home }, true)),
       })));
       for (const entry of found) {
         if (entry.status === "fulfilled" && !list.some((account) => account.identityKey === entry.value.identityKey)) list.push(entry.value);
@@ -141,7 +141,7 @@ async function openLogin(provider, selected) {
   const quote = (argument) => "'" + argument.replaceAll("'", "''") + "'";
   const switchEnvironment = provider === "copilot" ? "Remove-Item Env:GH_TOKEN,Env:GITHUB_TOKEN,Env:COPILOT_GITHUB_TOKEN -ErrorAction SilentlyContinue; " : "";
   const command = (profile ? `$env:${variable} = ${quote(profile)}; ` : "") + switchEnvironment +
-    `& ${quote(service.cli)}${selected ? "" : provider === "codex" ? " login --device-auth" : " login"}`;
+    `& ${quote(service.cli)}${selected ? "" : provider === "codex" ? " login --device-auth" : provider === "claude" ? " auth login" : " login"}`;
   const encoded = Buffer.from(command, "utf16le").toString("base64");
   const executable = join(process.env.SystemRoot || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
   await new Promise((resolve, reject) => {

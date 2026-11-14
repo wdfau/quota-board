@@ -65,7 +65,7 @@ try {
   await expect(panel.locator(".account.active")).toContainText("个人");
 
   await panel.getByRole("button", { name: "返回总览" }).click();
-  await expect(panel.getByText("个人")).toBeVisible();
+  await expect(panel.locator(".tile").getByText("个人", { exact: true })).toBeVisible();
   const fullWidth = await panel.evaluate(() => innerWidth);
   await settings.getByRole("button", { name: "Cursor" }).click();
   await settings.getByRole("switch").uncheck();

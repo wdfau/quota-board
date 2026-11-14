@@ -9,7 +9,8 @@
 | Codex | 安装并登录 Codex CLI 后重新扫描。可读取官方 CLI 返回的周期。 |
 | GitHub Copilot | 安装并登录 Copilot CLI 后重新扫描。使用官方 SDK 读取可用配额。若 CLI 安装方式只提供 `.cmd`，需要安装能在 PATH 中调用的原生 `copilot.exe`。 |
 | Claude | 安装并登录 Claude Code 可识别当前 CLI 身份。额度需在设置中连接 [Claude Code 状态栏](https://code.claude.com/docs/en/statusline) 导出的本机快照。 |
-| Cursor、Kiro | 添加邮箱确认账号，再从官网核对并手动记录额度。 |
+| Kiro | 可扫描 Kiro CLI 的当前账号。额度可在 Kiro CLI 输入 `/usage` 或从官网核对，并手动记录。 |
+| Cursor | 添加邮箱确认账号，再从官网核对并手动记录额度。 |
 
 对于 Codex 或 Copilot，设置中的「添加账号 → 官方登录」会打开独立 CLI 配置。切换后更新看板的当前账号，选中的独立 CLI 配置会在终端中打开。各服务的桌面应用登录由平台管理。官方未返回数值时，额度显示为「暂无额度」。
 
