@@ -1,17 +1,20 @@
 import { _electron as electron, expect } from "@playwright/test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const dir = await mkdtemp(join(tmpdir(), "quota-board-test-"));
-const electronApp = await electron.launch({
-  args: [fileURLToPath(new URL("../", import.meta.url))],
-  env: { ...process.env, QUOTA_BOARD_TEST_DATA_DIR: dir },
-  timeout: 30000,
-});
+const env = { ...process.env, QUOTA_BOARD_TEST_DATA_DIR: dir };
+delete env.ELECTRON_RUN_AS_NODE;
+let electronApp;
 
 try {
+  electronApp = await electron.launch({
+    args: [resolve(fileURLToPath(new URL("../", import.meta.url))), "--user-data-dir=" + dir],
+    env,
+    timeout: 30000,
+  });
   const setup = await electronApp.firstWindow();
   const dashboard = electronApp.waitForEvent("window", { predicate: (page) => page.url().includes("surface=board"), timeout: 15000 });
   await expect(setup.getByRole("heading", { name: "选择平台" })).toBeVisible();
@@ -74,10 +77,10 @@ try {
 
   await settings.getByRole("button", { name: "退出或重启额度看板" }).click();
   await expect(settings.getByRole("button", { name: "退出", exact: true })).toBeVisible();
-  await expect(settings.getByRole("button", { name: "重启" })).toBeVisible();
+  await expect(settings.getByRole("button", { name: "重启", exact: true })).toBeVisible();
   await settings.getByRole("button", { name: "取消" }).click();
   console.log("Windows application flow passed");
 } finally {
-  await electronApp.close();
+  await electronApp?.close();
   await rm(dir, { recursive: true, force: true });
 }
