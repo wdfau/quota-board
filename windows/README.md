@@ -1,6 +1,6 @@
 # 额度看板 · Windows 预览版
 
-适用于 Windows 11 x64。从 [GitHub Release](https://github.com/wdfau/quota-board/releases/tag/windows-v1.0.0) 下载 `QuotaBoard-windows-x64-1.0.0.zip`，解压整个目录，双击 `Quota Board.exe`。有仓库访问权限的账号可直接下载。预览版应用未签名。
+适用于 Windows 11 x64。从 [GitHub Release](https://github.com/wdfau/quota-board/releases/tag/windows-v1.0.0) 下载 `QuotaBoard-windows-x64-1.0.0.zip`，解压整个目录，双击 `Quota Board.exe`。预览版应用未签名。
 
 额度看板入口在任务栏通知区域，也可以在隐藏图标菜单中找到。首次打开会引导选择平台、勾选账号、确认导入。总览显示当前账号的最短额度周期，平台详情显示该平台所有已导入账号的额度和重置时间。双击另一个账号并确认即可切换。右上角齿轮进入设置，设置右下角电源图标可退出或重启。
 
